@@ -1,7 +1,9 @@
 // A small sampling profiler for Windows: starts a program at High priority (so the session's
 // background throttling does not distort it), samples every thread's stack, and prints the functions
 // by exclusive and by inclusive sample count. Needs the program's .pdb beside it.
-//   sampler [-ms N] [-top N] [-o report.txt] program args...
+//   sampler [-ms N] [-top N] [-depth N] [-o report.txt] program args...
+// -depth 1 samples only the running function (cheap, so -ms 1 gives many samples); deep stacks cost
+// ~0.1 s per sample on a compile that recurses thousands of frames.
 #include <windows.h>
 #include <dbghelp.h>
 #include <tlhelp32.h>
@@ -35,11 +37,12 @@ static const std::string &NameOf(DWORD64 addr) {
 }
 
 int main(int argc, char **argv) {
-    int ms = 2, top = 60, a = 1;
+    int ms = 2, top = 60, a = 1, depth = 20000;
     const char *out = nullptr;
     for (; a < argc && argv[a][0] == '-'; a++) {
         if (!strcmp(argv[a], "-ms") && a + 1 < argc) ms = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-top") && a + 1 < argc) top = atoi(argv[++a]);
+        else if (!strcmp(argv[a], "-depth") && a + 1 < argc) depth = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-o") && a + 1 < argc) out = argv[++a];
         else break;
     }
@@ -76,7 +79,8 @@ int main(int argc, char **argv) {
                     sf.AddrFrame.Offset = ctx.Rbp; sf.AddrFrame.Mode = AddrModeFlat;
                     sf.AddrStack.Offset = ctx.Rsp; sf.AddrStack.Mode = AddrModeFlat;
                     std::vector<DWORD64> st;
-                    for (int d = 0; d < 20000; d++) {
+                    if (depth == 1) st.push_back(ctx.Rip);
+                    else for (int d = 0; d < depth; d++) {
                         if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64, proc, th, &sf, &ctx, nullptr, SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) break;
                         if (!sf.AddrPC.Offset) break;
                         st.push_back(sf.AddrPC.Offset);
