@@ -1296,6 +1296,21 @@ inline bool TypeCheck::StaticCanContain(TypeExpr *of) {
 // The types of the storage a value of type t leads to through the plain
 // references and slices it holds, at any remove, each once.
 inline void TypeCheck::ReachedThroughRefs(TypeExpr *t, vector<TypeExpr *> &out) {
+    // Asked of the same few types at every shrink, so the answer for a
+    // complete graph is kept, as StableTypeQuery keeps its own. One added to
+    // types already in `out` depends on those and takes the walk.
+    auto alone = out.empty();
+    if (alone) {
+        if (auto known = reachedthrough.find(t); known != reachedthrough.end()) {
+            out = known->second;
+            return;
+        }
+    }
+    ReachedThroughRefsWalk(t, out);
+    if (alone && !typesbuilding && stabletypes.Ready(t)) reachedthrough[t] = out;
+}
+
+inline void TypeCheck::ReachedThroughRefsWalk(TypeExpr *t, vector<TypeExpr *> &out) {
     vector<TypeExpr *> work;
     RefPointees(t, work);
     while (!work.empty()) {

@@ -110,6 +110,8 @@ struct TypeCheck {
     // at each store and shrink it judges.
     using TypePairCache = flat_map<pair<TypeExpr *, TypeExpr *>, bool>;
     TypePairCache cancontain, reachesthrough;
+    // ReachedThroughRefs of a type whose graph is complete (StableTypeQuery).
+    unordered_map<TypeExpr *, vector<TypeExpr *>> reachedthrough;
     bool library = false;   // Built for a C host (--header): fn main() is optional.
     bool nomain = false;    // Checking only: a file without fn main() is checked on its own.
 
@@ -1771,6 +1773,7 @@ struct TypeCheck {
     bool MayHoldValueOf(TypeExpr *t, TypeExpr *of);
     bool MaySameType(TypeExpr *a, TypeExpr *b);
     void ReachedThroughRefs(TypeExpr *t, vector<TypeExpr *> &out);
+    void ReachedThroughRefsWalk(TypeExpr *t, vector<TypeExpr *> &out);
     bool ReachesThroughRefs(TypeExpr *t, TypeExpr *of);
     void BoundReach(VarDef *r, vector<TypeExpr *> &out);
     TypeExpr *PointeeOf(TypeExpr *t);
