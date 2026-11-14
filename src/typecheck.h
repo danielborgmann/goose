@@ -344,6 +344,7 @@ struct TypeCheck {
     struct BlockScope {
         TypeCheck &tc;
         BlockScope(TypeCheck &_tc, Block *b) : tc(_tc) {
+            tc.DropNameUnit(b);
             tc.blockpos.push_back({ b, 0, (int)tc.scopes.size() - 1 });
         }
         ~BlockScope() { tc.blockpos.pop_back(); }
@@ -364,6 +365,36 @@ struct TypeCheck {
     bool IsValuelessTail(const Node *n);
     bool MentionsName(Node *n, string_view name, set<SFunction *> &seen);
     bool EscapingContinue(Node *n);
+    // What MentionsName and EscapingContinue read under one node, collected
+    // once. UsedAfter asks about the same statements for every variable at
+    // every shrink, and a loop's body again at each shrink inside it, so it
+    // reads these summaries where the tree cannot have changed since: the
+    // checker rewrites a tree only under the statement it is checking, so a
+    // block that is not open (not in blockpos), and a statement of an open
+    // block other than the one it is at, are as they were when summarized.
+    // The summary of a block is dropped when the block is opened, and that
+    // of a statement when its check starts (CheckStmts).
+    struct NameUnit {
+        const Node *owner = nullptr;
+        uint64_t bloom = 0;             // One bit per name in `names`, by hash.
+        vector<string_view> names;      // Every Ident's name, sorted.
+        vector<string_view> callees;    // Every call's callee name, sorted.
+        vector<SFunction *> fns;        // Every nested function declared.
+        int8_t escapes = -1;            // EscapingContinue, once asked: 0 or 1.
+    };
+    deque<NameUnit> nameunits;
+    vector<uint32_t> freenameunits;
+    bool verifynameunits = getenv("GOOSE_VERIFY_NAMEUNITS") != nullptr;
+    void DropNameUnit(Node *n) {
+        if (!n || !n->nameunit) return;
+        if (n->nameunit < nameunits.size() && nameunits[n->nameunit].owner == n)
+            freenameunits.push_back(n->nameunit);
+        n->nameunit = 0;
+    }
+    NameUnit &NameUnitOf(Node *n);
+    bool UnitMentions(Node *n, string_view name, uint64_t bit, set<SFunction *> &seen);
+    bool MentionsNameFast(Node *n, string_view name, uint64_t bit, set<SFunction *> &seen);
+    bool UnitEscapingContinue(Node *n);
     bool UsedAfter(VarDef *v);
 
     // The node being checked and every node it is nested in, innermost last,

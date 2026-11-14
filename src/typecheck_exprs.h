@@ -3228,9 +3228,12 @@ inline void TypeCheck::CheckStmts(Block *b) {
         blockpos.back().idx = i;
         if (auto cf = Is<ConstFor>(b->stmts[i])) b->stmts[i] = ExpandStatements(cf);
         if (auto ci = Is<ConstIf>(b->stmts[i])) b->stmts[i] = ExpandSelection(ci);
+        DropNameUnit(b->stmts[i]);
         CheckStmt(b->stmts[i]);
     }
     if (lost(b->stmts.size())) throw Abandoned {};
+    // The tail is checked next, by the caller.
+    DropNameUnit(b->tail);
     // Drop the unreachable suffix (including the tail), so later passes never
     // see unchecked nodes. Function bodies are specialization clones; unknown
     // recursive calls may return, so only proven exits can prune them.
@@ -3278,6 +3281,116 @@ inline bool TypeCheck::EscapingContinue(Node *n) {
     auto hit = false;
     n->Children([&](Node *ch) { hit = hit || (ch != body && EscapingContinue(ch)); });
     return hit;
+}
+
+// The summary of the code under n (NameUnit), made if n has none.
+inline TypeCheck::NameUnit &TypeCheck::NameUnitOf(Node *n) {
+    if (n->nameunit && n->nameunit < nameunits.size() && nameunits[n->nameunit].owner == n)
+        return nameunits[n->nameunit];
+    if (nameunits.empty()) nameunits.emplace_back();
+    uint32_t slot;
+    if (!freenameunits.empty()) {
+        slot = freenameunits.back();
+        freenameunits.pop_back();
+    } else {
+        slot = (uint32_t)nameunits.size();
+        nameunits.emplace_back();
+    }
+    auto &u = nameunits[slot];
+    u = NameUnit {};
+    u.owner = n;
+    function<void(Node *)> collect = [&](Node *x) {
+        if (!x) return;
+        if (auto id = Is<Ident>(x)) u.names.push_back(id->name);
+        if (auto fd = Is<FnDecl>(x)) u.fns.push_back(fd->sf);
+        if (auto c = Is<Call>(x)) {
+            if (auto id = Is<Ident>(c->callee)) u.callees.push_back(id->name);
+            else if (auto d = Is<Dot>(c->callee)) u.callees.push_back(d->name);
+        }
+        x->Children(collect);
+    };
+    collect(n);
+    auto uniq = [](auto &v) {
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+    };
+    uniq(u.names);
+    uniq(u.callees);
+    uniq(u.fns);
+    for (auto name : u.names) u.bloom |= 1ull << (std::hash<string_view> {}(name) & 63);
+    n->nameunit = slot;
+    return u;
+}
+
+// MentionsName(n, name, seen) from n's summary. `bit` is name's bloom bit.
+inline bool TypeCheck::UnitMentions(Node *n, string_view name, uint64_t bit,
+                                    set<SFunction *> &seen) {
+    if (!n) return false;
+    auto &u = NameUnitOf(n);
+    if ((u.bloom & bit) && std::binary_search(u.names.begin(), u.names.end(), name)) return true;
+    for (auto sf : u.fns)
+        if (sf->body && seen.insert(sf).second && MentionsNameFast(sf->body, name, bit, seen))
+            return true;
+    if (!localfns.empty()) {
+        for (auto callee : u.callees) {
+            if (callee.empty()) continue;
+            for (auto &[si, sf] : localfns)
+                if (sf->name == callee && sf->body && seen.insert(sf).second &&
+                    MentionsNameFast(sf->body, name, bit, seen))
+                    return true;
+        }
+    }
+    return false;
+}
+
+// MentionsName, reading summaries where the tree is settled: of a block that
+// is not open, and of the statements of an open one that it is not at.
+inline bool TypeCheck::MentionsNameFast(Node *n, string_view name, uint64_t bit,
+                                        set<SFunction *> &seen) {
+    if (!n) return false;
+    if (auto b = Is<Block>(n)) {
+        const BlockPos *open = nullptr;
+        for (auto bp = blockpos.rbegin(); bp != blockpos.rend() && !open; ++bp)
+            if (bp->block == b) open = &*bp;
+        if (!open) return UnitMentions(b, name, bit, seen);
+        auto at = open->idx;
+        for (size_t i = 0; i < b->stmts.size(); i++) {
+            if (i == at ? MentionsNameFast(b->stmts[i], name, bit, seen)
+                        : UnitMentions(b->stmts[i], name, bit, seen))
+                return true;
+        }
+        return at >= b->stmts.size() ? MentionsNameFast(b->tail, name, bit, seen)
+                                     : UnitMentions(b->tail, name, bit, seen);
+    }
+    if (auto id = Is<Ident>(n); id && id->name == name) return true;
+    if (auto fd = Is<FnDecl>(n)) {
+        if (fd->sf->body && seen.insert(fd->sf).second &&
+            MentionsNameFast(fd->sf->body, name, bit, seen))
+            return true;
+    }
+    if (auto c = Is<Call>(n)) {
+        string_view callee;
+        if (auto id = Is<Ident>(c->callee)) callee = id->name;
+        else if (auto d = Is<Dot>(c->callee)) callee = d->name;
+        if (!callee.empty()) {
+            for (auto &[si, sf] : localfns)
+                if (sf->name == callee && sf->body && seen.insert(sf).second &&
+                    MentionsNameFast(sf->body, name, bit, seen))
+                    return true;
+        }
+    }
+    auto hit = false;
+    n->Children([&](Node *ch) { hit = hit || MentionsNameFast(ch, name, bit, seen); });
+    return hit;
+}
+
+// EscapingContinue of a statement of an open block that the block is not at,
+// kept in its summary.
+inline bool TypeCheck::UnitEscapingContinue(Node *n) {
+    if (!n) return false;
+    auto &u = NameUnitOf(n);
+    if (u.escapes < 0) u.escapes = EscapingContinue(n);
+    return u.escapes != 0;
 }
 
 // Whether the rest of the statement being checked (LaterOperands) may take a
@@ -3349,10 +3462,21 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
     // Components have no source identifier of their own. A later use of
     // their owner conservatively keeps the component's stored views live.
     if (v->componentowner && v->type) v = v->componentowner;
-    set<SFunction *> seen;
+    set<SFunction *> seen, seenplain;
     auto vframe = FrameOfScope(Depth(v) - 1);
-    auto mentions = [&](Node *n, int fi) {
-        return NamesFrame(fi, vframe) && MentionsName(n, v->name, seen);
+    auto bit = 1ull << (std::hash<string_view> {}(v->name) & 63);
+    // `settled` is a statement of an open block after the one it is at, or
+    // that block's tail before it is reached, which has a summary.
+    auto mentions = [&](Node *n, int fi, bool settled = false) {
+        if (!NamesFrame(fi, vframe)) return false;
+        auto m = settled ? UnitMentions(n, v->name, bit, seen)
+                         : MentionsNameFast(n, v->name, bit, seen);
+        if (verifynameunits && m != MentionsName(n, v->name, seenplain)) {
+            fprintf(stderr, "GOOSE_VERIFY_NAMEUNITS: %s differs at line %d\n",
+                    string(v->name).c_str(), n ? (int)n->line.line : 0);
+            abort();
+        }
+        return m;
     };
     auto later = false;
     LaterOperands([&](Node *n, int fi) { later = later || mentions(n, fi); });
@@ -3369,7 +3493,7 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
             bp.idx < stmts.size() && !EscapingContinue(stmts[bp.idx])) {
             for (auto i = bp.idx + 1; i <= stmts.size(); i++) {
                 auto s = i < stmts.size() ? stmts[i] : bp.block->tail;
-                if (!s || EscapingContinue(s)) break;
+                if (!s || UnitEscapingContinue(s)) break;
                 auto to = Is<Return>(s) ? frames[frameidx].scopebase
                           : Is<Break>(s) ? FindBreakScope(false)
                                          : -1;
@@ -3401,9 +3525,9 @@ inline bool TypeCheck::UsedAfter(VarDef *v) {
         if (bp.scopeidx >= cut && !exits) continue;
         auto end = exits ? min(exitat + 1, stmts.size()) : stmts.size();
         for (auto i = bp.idx + 1; i < end; i++)
-            if (mentions(stmts[i], fi)) return true;
+            if (mentions(stmts[i], fi, true)) return true;
         if ((!exits || exitat == stmts.size()) && bp.idx < stmts.size() && bp.block->tail &&
-            mentions(bp.block->tail, fi))
+            mentions(bp.block->tail, fi, true))
             return true;
     }
     return false;

@@ -870,6 +870,9 @@ struct Node {
     // Specialization-time provenance, retained in clones for diagnostics.
     string_view expansiontrace;
     int expansionbinding = 0;   // Ident or Dot: a lexical expansion binding.
+    // The checker's summary of the names under this node, while it has one
+    // (TypeCheck::NameUnit); 0 for none. A clone starts without one.
+    uint32_t nameunit = 0;
     Node(Line _line, NodeKind _nkind) : line(_line), nkind(_nkind) {}
     virtual ~Node() {}
     virtual void Dump(string &s, int ind) const = 0;
