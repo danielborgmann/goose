@@ -1611,6 +1611,7 @@ inline void TypeCheck::HolderFromLit(Val &v, const LitDeep &deep) {
 inline void TypeCheck::AddStoreEvent(const StoreEvent &e) {
     e.container->storedinto = true;
     storeevents.push_back(e);
+    IndexStoreEvent(storeevents.size() - 1);
     madestores.push_back(e);
     NoteSlotStore(e);
     if (e.container->type || e.container->isglobal) return;
@@ -1945,8 +1946,13 @@ inline void TypeCheck::ApplyCalleeStores(FnSpec *spec, vector<Val> &argvals, Nod
             e.root = a.root;
             e.exact = a.exact;
             e.src = src;
-            if (k == 0) storeevents[i] = e;
-            else storeevents.push_back(e);
+            if (k == 0) {
+                storeevents[i] = e;
+                IndexStoreEvent(i);
+            } else {
+                storeevents.push_back(e);
+                IndexStoreEvent(storeevents.size() - 1);
+            }
         }
     }
     // What a store into a slot put there, as seen from here. A slice loaded
@@ -2492,7 +2498,9 @@ inline bool TypeCheck::HolderMayPointInto(VarDef *holder, VarDef *arr, TypeExpr 
         if (incoming && e.incoming && !through) *incoming = holder;
         return true;
     };
-    for (auto i = from; i < storeevents.size(); i++) {
+    auto [storelist, storefirst] = StoresOf(holder, from);
+    for (auto storepos = storefirst; storepos < storelist->size(); storepos++) {
+        auto i = (*storelist)[storepos];
         auto &e = storeevents[i];
         if (e.container != holder || StoredLater(i)) continue;
         auto hit = false;
@@ -2536,7 +2544,8 @@ inline bool TypeCheck::HolderMayPointInto(VarDef *holder, VarDef *arr, TypeExpr 
     // one to the storage itself would: its own stores, followed above, and
     // for a slice's slot, which may be a slice variable, anything the class
     // outlives.
-    for (auto i = from; i < storeevents.size(); i++) {
+    for (auto storepos = storefirst; storepos < storelist->size(); storepos++) {
+        auto i = (*storelist)[storepos];
         auto &e = storeevents[i];
         if (e.container != holder || (e.src && (e.src->type || e.src->isglobal)) ||
             StoredLater(i))
@@ -3248,7 +3257,9 @@ template<typename F> void TypeCheck::EachHolderRoot(VarDef *holder, size_t from,
         if (!seen.insert(h).second) return;
         if (h->type && ClassOf(h->type) == SC_ROOT)
             for (auto c : h->components) if (c) walk(c, start);
-        for (auto i = start; i < storeevents.size(); i++) {
+        auto [storelist, storefirst] = StoresOf(h, start);
+        for (auto storepos = storefirst; storepos < storelist->size(); storepos++) {
+            auto i = (*storelist)[storepos];
             auto e = storeevents[i];
             if (e.container != h || StoredLater(i)) continue;
             if (e.src && !e.src->isglobal && e.src->type) {

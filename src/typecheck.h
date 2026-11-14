@@ -2610,6 +2610,21 @@ struct TypeCheck {
     // (ast.h StoreEvent), program-wide: a function value's body stores into
     // its lexical function's containers while being checked in another frame.
     vector<StoreEvent> storeevents;
+    // The events that name each container, by index, ascending: the scans
+    // for one holder's stores read these instead of every event of the
+    // program. An event rewritten for another container (ApplyCalleeStores)
+    // stays listed under the one it left, so a reader still compares.
+    unordered_map<VarDef *, vector<size_t>> storesof;
+    void IndexStoreEvent(size_t i) {
+        auto &at = storesof[storeevents[i].container];
+        auto p = std::lower_bound(at.begin(), at.end(), i);
+        if (p == at.end() || *p != i) at.insert(p, i);
+    }
+    // Where the events of h from event `from` on start in h's list.
+    pair<const vector<size_t> *, size_t> StoresOf(VarDef *h, size_t from) {
+        auto &at = storesof[h];
+        return { &at, (size_t)(std::lower_bound(at.begin(), at.end(), from) - at.begin()) };
+    }
     Node *fitnode = nullptr;         // The node MustFit is fitting, for RecordStore.
     // The deepest root among the references a literal under construction
     // holds: its holder root (§9.2). Each literal owns its accumulator, so
