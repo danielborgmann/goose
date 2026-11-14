@@ -1361,6 +1361,38 @@ inline void TypeCheck::BoundReach(VarDef *r, vector<TypeExpr *> &out) {
 // points at lead on into more of the caller's storage, which this function
 // cannot enumerate: everything stored there outlives the parameter's root,
 // so that root stands in for it, as a bound.
+// The globals and their components, in declaration order, that
+// RootCandidates still has to consider for `of`; null where every one has
+// to be. A global that is no reference or slice is a candidate only where
+// its type can contain an `of`, which for two complete type graphs does not
+// change (StableTypeQuery), so the others are left out once. Listed whatever
+// it holds: a reference or slice, whose binding decides, and one whose type
+// is not complete yet. While a global has no type at all the answer also
+// says so (`unchecked`), and nothing is kept.
+inline const vector<VarDef *> *TypeCheck::GlobalCandidatesFor(TypeExpr *of) {
+    if (typesbuilding) return nullptr;
+    size_t vars = 0;
+    for (auto g : ast.globals)
+        for (auto gd : g->defs) vars += 1 + gd->components.size();
+    auto known = globalcandidates.find(of);
+    if (known != globalcandidates.end() && known->second.vars == vars) return &known->second.list;
+    if (!stabletypes.Ready(of)) return nullptr;
+    GlobalCandidates made;
+    made.vars = vars;
+    auto take = [&](VarDef *v) {
+        if (!v->type || IsRefOrSlice(v->type) || !stabletypes.Ready(v->type) ||
+            CanContain(v->type, of))
+            made.list.push_back(v);
+    };
+    for (auto g : ast.globals)
+        for (auto gd : g->defs) {
+            if (!gd->type) return nullptr;
+            take(gd);
+            for (auto c : gd->components) if (c) take(c);
+        }
+    return &(globalcandidates[of] = std::move(made)).list;
+}
+
 inline Roots TypeCheck::RootCandidates(TypeExpr *of, int d, bool globalsonly, bool writable,
                                        bool slots) {
     Roots out;
@@ -1390,12 +1422,35 @@ inline Roots TypeCheck::RootCandidates(TypeExpr *of, int d, bool globalsonly, bo
     };
     if (!globalsonly) VisibleVars([&](VarDef *v) { if (!v->isglobal) consider(v, d); });
     auto unchecked = false;
-    for (auto g : ast.globals)
-        for (auto gd : g->defs) {
-            consider(gd, 0);
-            for (auto c : gd->components) if (c) consider(c, 0);
-            unchecked = unchecked || (!gd->type && !(g->type && IsRefOrSlice(g->type)));
+    auto every = [&]() {
+        for (auto g : ast.globals)
+            for (auto gd : g->defs) {
+                consider(gd, 0);
+                for (auto c : gd->components) if (c) consider(c, 0);
+                unchecked = unchecked || (!gd->type && !(g->type && IsRefOrSlice(g->type)));
+            }
+    };
+    if (auto listed = GlobalCandidatesFor(of)) {
+        auto before = out;
+        for (auto v : *listed) consider(v, 0);
+        if (verifynameunits) {
+            auto fast = out;
+            out = before;
+            every();
+            auto same = !unchecked && fast.alts.size() == out.alts.size();
+            for (size_t i = 0; same && i < out.alts.size(); i++)
+                same = fast.alts[i].root == out.alts[i].root &&
+                       fast.alts[i].exact == out.alts[i].exact &&
+                       fast.alts[i].from == out.alts[i].from;
+            if (!same) {
+                fprintf(stderr, "GOOSE_VERIFY_NAMEUNITS: global candidates differ for %s\n",
+                        TypeStr(of).c_str());
+                abort();
+            }
         }
+    } else {
+        every();
+    }
     // A writable reference or slice is never given static data but a null or an
     // empty slice (§9.5: literals only go into const slots), which point at no
     // storage, so static data does not stand beside a real candidate for one.

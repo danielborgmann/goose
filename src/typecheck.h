@@ -1785,6 +1785,16 @@ struct TypeCheck {
     // slice variable's own.
     Roots RootCandidates(TypeExpr *of, int d, bool globalsonly, bool writable,
                          bool slots = false);
+    // The globals RootCandidates has to look at for a pointee type: all but
+    // those whose own complete type cannot contain one, which never are
+    // candidates. `vars` counts the globals and components the list was made
+    // from, and one made from fewer is made again.
+    struct GlobalCandidates {
+        size_t vars = 0;
+        vector<VarDef *> list;
+    };
+    unordered_map<TypeExpr *, GlobalCandidates> globalcandidates;
+    const vector<VarDef *> *GlobalCandidatesFor(TypeExpr *of);
 
     bool TempContents(const Val &v, ReadBack &contents);
     // `inplace`: the read is made where it is checked, which a loop's passes
