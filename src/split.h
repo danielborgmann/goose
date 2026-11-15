@@ -10,7 +10,8 @@
 // and gets external linkage; a unit holds the runtime's header, then only
 // the items its definitions name (types whole, other units' functions and
 // data as declarations), then its definitions. A GS_INLINE function stays
-// static and is repeated in every unit that calls it.
+// static and is repeated in every unit that calls it, and so is a static copy
+// of a small function, for the C compiler to inline.
 #pragma once
 
 namespace goose {
@@ -32,6 +33,7 @@ struct Splitter {
         vector<int> deps;      // Name ids the whole item mentions.
         vector<int> decldeps;  // Name ids `decl` mentions.
         string unit;           // FN, DATA: the unit it goes in, when not by its name.
+        bool copyable = false; // FN: copied, static, into every unit that calls it.
     };
     vector<Item> items;
     unordered_map<string_view, int> nameids;
@@ -683,6 +685,37 @@ inline vector<SplitUnit> SplitProgram(CodeGen &cg, const string &pre, const stri
 
     auto &items = s.items;
     auto owned = [&](const Splitter::Item &it) { return it.kind == Splitter::FN || it.kind == Splitter::DATA; };
+    // A small function is also copied, static, into each other unit that
+    // calls it, so that the C compiler can inline it there as it would in
+    // the one file: the split's cost at run time is mostly small helpers
+    // called from everywhere. Not one whose address is taken (copies have
+    // addresses of their own), one with a static local, or a simd variant.
+    // The limit is in bytes of C, GOOSE_SPLIT_INLINE (0: copy none).
+    size_t inlinemax = 1000;
+    if (auto e = getenv("GOOSE_SPLIT_INLINE")) inlinemax = (size_t)atoll(e);
+    if (inlinemax) {
+        vector<bool> addressed(s.byname.size(), false);
+        auto note = [&](string_view t) {
+            Splitter::EachIdent(t, [&](size_t b, size_t e) {
+                auto at = s.nameids.find(t.substr(b, e - b));
+                if (at == s.nameids.end()) return;
+                while (e < t.size() && (t[e] == ' ' || t[e] == '\t' || t[e] == '\n')) e++;
+                if (e >= t.size() || t[e] != '(') addressed[at->second] = true;
+            });
+        };
+        for (auto &it : items) { note(it.text); note(it.decl); note(it.defn); }
+        note(ext);
+        note(headertext);
+        note(forwarders);
+        for (auto &it : items) {
+            if (it.kind != Splitter::FN || it.defn.size() > inlinemax || !it.unit.empty() ||
+                it.names[0] == "main" || Splitter::Starts(it.defn, "#") ||
+                Splitter::Starts(it.defn, "GS_NOINLINE") || it.defn.find("static ") != string::npos)
+                continue;
+            auto at = s.nameids.find(it.names[0]);
+            it.copyable = at != s.nameids.end() && !addressed[at->second];
+        }
+    }
     size_t total = 0;
     for (auto &it : items) if (owned(it)) total += it.defn.size();
     auto target = (size_t)std::max<int64_t>(targetkb, 1) * 1000;
@@ -716,19 +749,22 @@ inline vector<SplitUnit> SplitProgram(CodeGen &cg, const string &pre, const stri
     if (hasheaders) units["headers"];
 
     vector<SplitUnit> out;
-    vector<uint8_t> need(items.size());   // 1: its declaration, 2: all of it.
+    // 1: its declaration, 2: all of it, 3: a static copy of a function
+    // defined in another unit.
+    vector<uint8_t> need(items.size());
     vector<pair<int, bool>> work;
     vector<int> chosen;
     for (auto &[name, mine] : units) {
         std::fill(need.begin(), need.end(), 0);
         chosen.clear();
         auto take = [&](int i, bool full) {
-            // Only a definition's own unit holds more than its declaration.
-            uint8_t level = full || !owned(items[i]) ? 2 : 1;
-            if (need[i] >= level) return;
+            // Only a definition's own unit holds more than its declaration,
+            // but for the copies.
+            uint8_t level = full || !owned(items[i]) ? 2 : items[i].copyable ? 3 : 1;
+            if (need[i] == level || need[i] == 2 || (need[i] == 3 && level == 1)) return;
             if (!need[i]) chosen.push_back(i);
             need[i] = level;
-            work.push_back({ i, level == 2 });
+            work.push_back({ i, level >= 2 });
         };
         auto want = [&](int nameid) { for (auto i : s.byname[nameid]) take(i, false); };
         for (auto i : mine) take(i, true);
@@ -755,8 +791,11 @@ inline vector<SplitUnit> SplitProgram(CodeGen &cg, const string &pre, const stri
         }
         if (packed) t += "#pragma pack(pop)\n";
         // Every declaration first, so that definitions may come in any order.
-        for (auto i : chosen)
-            if (!items[i].decl.empty() && !(items[i].anontype && need[i] == 2)) t += items[i].decl;
+        for (auto i : chosen) {
+            if (items[i].decl.empty() || (items[i].anontype && need[i] == 2)) continue;
+            if (need[i] == 3) t += "static ";
+            t += items[i].decl;
+        }
         for (auto i : chosen)
             if (items[i].kind == Splitter::MACRO || items[i].kind == Splitter::PROTO) t += items[i].text;
         t += ext;
@@ -768,7 +807,11 @@ inline vector<SplitUnit> SplitProgram(CodeGen &cg, const string &pre, const stri
         }
         for (auto i : chosen) if (items[i].kind == Splitter::DATA && need[i] == 2) t += items[i].defn;
         for (auto i : chosen) if (items[i].kind == Splitter::INLINE) t += items[i].defn;
-        for (auto i : chosen) if (items[i].kind == Splitter::FN && need[i] == 2) t += items[i].defn;
+        for (auto i : chosen) {
+            if (items[i].kind != Splitter::FN || need[i] < 2) continue;
+            if (need[i] == 3) t += "static ";
+            t += items[i].defn;
+        }
         Append(t, "void gs_split_set_", name, "(gs_stack *s, int64_t n, void *gl) "
                   "{ gs_stks = s; gs_nstks = n; gs_gl = gl; }\n");
         if (name == "main") {
