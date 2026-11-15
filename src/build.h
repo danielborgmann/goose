@@ -21,7 +21,16 @@ struct BuildOptions {
     string exe;               // -o: the executable/library; "" puts it beside the root source
     bool split = false;       // --split: the program's C as units (split.h), compiled apart and kept
     int64_t splitkb = 128;    // About how much C a unit defines (GOOSE_SPLIT_KB)
+    bool stats = false;       // --stats: also how long the C compile and the link took
 };
+
+// Seconds since `t`, which moves on to now.
+inline double SecondsSince(std::chrono::steady_clock::time_point &t) {
+    auto now = std::chrono::steady_clock::now();
+    auto s = std::chrono::duration<double>(now - t).count();
+    t = now;
+    return s;
+}
 
 inline string AbsolutePath(const string &path) {
     std::error_code ec;
@@ -394,6 +403,7 @@ inline int BuildExecutable(const string &rootfile, const string &cfile, const st
                            const vector<string> &nativersps, const string &output,
                            const vector<SplitUnit> *units = nullptr) {
     Builder b { tc, opts, msgs };
+    auto t = std::chrono::steady_clock::now();
     vector<string> objects;
     if (!opts.standalone) {
         auto obj = RuntimeObject(b);
@@ -423,15 +433,22 @@ inline int BuildExecutable(const string &rootfile, const string &cfile, const st
         auto exedirpath = filesystem::path(exe).parent_path();
         if (!exedirpath.empty()) filesystem::create_directories(exedirpath, ec);
     }
+    auto runtime = SecondsSince(t);
     if (units) {
         auto unitsrsp = BuildSplitUnits(b, *units, builddir);
         if (unitsrsp.empty()) return 1;
+        auto compiled = SecondsSince(t);
         auto ltocache = b.SplitLTO() ? cat(builddir, "/units/lto-cache") : string();
         if (!b.LinkObjects(unitsrsp, objects, nativersps, exe, builddir, cat(builddir, "/cc.log"),
                            ltocache))
             return 1;
-    } else if (!b.Link(cfile, objects, nativersps, exe, builddir, cat(builddir, "/cc.log"))) {
-        return 1;
+        if (opts.stats)
+            fprintf(msgs, "time: runtime %.2f s, units %.2f s, link %.2f s\n", runtime, compiled,
+                    SecondsSince(t));
+    } else {
+        if (!b.Link(cfile, objects, nativersps, exe, builddir, cat(builddir, "/cc.log"))) return 1;
+        if (opts.stats)
+            fprintf(msgs, "time: runtime %.2f s, compile and link %.2f s\n", runtime, SecondsSince(t));
     }
     if (!opts.dryrun) fprintf(msgs, "built %s\n", exe.c_str());
     return 0;

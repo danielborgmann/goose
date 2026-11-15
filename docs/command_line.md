@@ -205,7 +205,7 @@ These options have the same meaning for `goose run`, `goose build`,
 | `--no-bce` | Keep every bounds check. The program's `checkfree` functions are then not verified, and the compiler warns about that. |
 | `--no-unreached` | Check only the functions the program reaches. By default a function nothing calls is checked on its own, with each of its reference, slice and holder parameters rooted at a global of its own, so that its errors are reported too; that check can specialize again much of what it calls, all of it dead code. With this option those errors go unreported. The generated code is the same, less the type definitions only unreached functions used. |
 | `--specs` | Print every specialization of each function, after optimization, as source. |
-| `--stats` | Print a few lines about what the compile did: the declarations parsed, the specializations and optimizations, the bounds checks removed, and the files written. |
+| `--stats` | Print a few lines about what the compile did: the declarations parsed, the specializations and optimizations, the bounds checks removed, the files written, and how long each phase took (a `time:` line; a build adds one for the C compile and the link). |
 | `--color auto\|always\|never` | Whether errors and warnings are in color ([§6](#6-what-goose-prints)). |
 | `--diagnostics text\|json` | Print errors and warnings as text on stderr (the default), or as JSON on stdout ([§6](#6-what-goose-prints)). |
 | `--offline` | Fetch nothing: a package that is not fetched yet is an error at its import ([§7](#7-packages)). |

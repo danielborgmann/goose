@@ -50,7 +50,7 @@ def check_diagnostics_json(exe, base):
             # A check's progress lines share stderr with the diagnostics in
             # text mode (they are a JIT run's, which stdout belongs to the
             # program in); the rest of stderr is the diagnostics' text.
-            progress = re.compile(r"^(?:parsed ok|roundtrip ok|typechecked ok|bce|bce-line):")
+            progress = re.compile(r"^(?:parsed ok|roundtrip ok|typechecked ok|bce|bce-line|time):")
             text = "".join(line for line in err.splitlines(True) if not progress.match(line))
             require(text == "".join(d["text"] + "\n" for d in diags),
                     f"{name}: the text mode's stderr is not the JSON's text",

@@ -676,7 +676,8 @@ constexpr const char *MULTIMARK = "==== goose --multi-test: exit";
 constexpr const char *COMPILEOPTIONS =
 R"(  --stats               Print what the compile did: the declarations parsed,
                         the specializations, the optimizations, the bounds
-                        checks removed and the files written.
+                        checks removed, the files written and how long
+                        each phase took.
   --color when          Color errors and warnings: auto (on a terminal, unless
                         NO_COLOR is set), always or never.
   --diagnostics json    Print the errors and warnings as JSON on stdout, and
@@ -729,7 +730,7 @@ Common options:
   --debug         Overflow, range and tag checks that name the source line
                   they fail on.
   --stats         Print what the compile did (declarations, bounds checks
-                  removed, files written).
+                  removed, files written, time per phase).
   --color when    Color errors and warnings: auto (on a terminal, unless
                   NO_COLOR is set), always or never.
   -- args...      What follows is the program's arguments.
@@ -1558,6 +1559,7 @@ int Main(int argc, char **argv) {
         buildopts = BuildOptions { debug, verbose, dryrun, standalone, shared, outname };
         // A standalone program's C holds the runtime's own state.
         buildopts.split = split && !standalone;
+        buildopts.stats = stats;
         if (auto e = getenv("GOOSE_SPLIT_KB")) buildopts.splitkb = std::max(1, atoi(e));
         outname.clear();
     }
@@ -1625,6 +1627,17 @@ int Main(int argc, char **argv) {
         auto &ast = *astp;
         if (jsondiag) ast.sink = [&](const Diagnostic &d) { found.push_back(d); };
         auto stdlibdirs = StdlibDirs(stdlibdir, exe);
+        // With --stats, how long each phase took, printed once the compile
+        // gets as far as it goes.
+        auto t = std::chrono::steady_clock::now();
+        string times;
+        auto phase = [&](const char *name) {
+            Append(times, times.empty() ? "time: " : ", ", name, " ");
+            char s[32];
+            snprintf(s, sizeof(s), "%.2f s", SecondsSince(t));
+            times += s;
+        };
+        auto printtimes = [&] { if (stats) fprintf(msgs, "%s\n", times.c_str()); };
         ParseProgram(ast, filename, stdlibdirs, DirOf(exe));
         // The parser reported what it recovered from as it went; nothing
         // further is asked of a program with a syntax error.
@@ -1669,11 +1682,14 @@ int Main(int argc, char **argv) {
             if (stats) fprintf(msgs, "roundtrip ok: %d bytes of dump\n", (int)dumped.size());
         }
         if (parseonly) return 0;
+        phase("parse");
         ast.nounreached = nounreached;
         TypeCheckProgram(ast, library, nocgen);
         // The checker reported the errors it went on past, root by root.
         if (!ast.errors.empty()) return 1;
+        phase("check");
         Optimizer opt(ast, optlevel);
+        phase("optimize");
         if (specs) {
             string s;
             opt.DumpSpecs(s);
@@ -1691,6 +1707,7 @@ int Main(int argc, char **argv) {
             if (stats) fprintf(msgs, "bce: elided %d/%d index and %d/%d slice checks\n",
                     bce.idxelided, bce.idxtotal, bce.slelided, bce.sltotal);
             if (!bce.checkfreefails.empty()) throw bce.CheckfreeError();
+            phase("bce");
         } else {
             for (auto sf : ast.functions)
                 // Not for the standard library's checkfree helpers, or every
@@ -1716,7 +1733,10 @@ int Main(int argc, char **argv) {
         }
         // --stacks needs the generated program's bounds, so --check runs
         // the backend for them and writes nothing.
-        if (nocgen && !stacks) return 0;
+        if (nocgen && !stacks) {
+            printtimes();
+            return 0;
+        }
         // Sidecar headers share --include's position after generated types.
         // They belong to every loaded package, not just those with a native
         // part: a header-only adapter needs no separate compilation or loading.
@@ -1740,6 +1760,7 @@ int Main(int argc, char **argv) {
         auto stackcfg = StackConfigOf(cdefines);
         CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, shared,
                    stackcfg.maxstacks);
+        phase("codegen");
         if (stacks) cg.StackReport(msgs, stackcfg);
         // The packages whose native parts the program needs, which a JIT
         // run takes functions from and a build links: its own, when it has
@@ -1813,6 +1834,8 @@ int Main(int argc, char **argv) {
                                      "compile with -o and a C compiler instead" };
             program = assemble(true, true);
         }
+        phase("emit");
+        printtimes();
         return 0;
     };
     // The C toolchain everything this command builds is built with, found
