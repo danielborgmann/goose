@@ -43,8 +43,15 @@ ProcessResult RunProcess(const vector<string> &argv, const string &cwd, bool ech
                    subprocess_option_search_user_path | subprocess_option_enable_async |
                    subprocess_option_no_window;
     subprocess_s p;
-    if (subprocess_create_ex(args.data(), options, nullptr, cwd.empty() ? nullptr : cwd.c_str(),
-                             &p)) {
+    // One at a time: a program started while another's pipes are being set
+    // up would inherit their ends, and keep that one's output open until it
+    // exits itself (the units of a split build are compiled side by side).
+    static std::mutex creating;
+    creating.lock();
+    auto failed = subprocess_create_ex(args.data(), options, nullptr,
+                                       cwd.empty() ? nullptr : cwd.c_str(), &p);
+    creating.unlock();
+    if (failed) {
         // subprocess.h leaves the reason in GetLastError on Windows, in
         // errno elsewhere.
         auto what = cat("cannot start ", argv.empty() ? string("(nothing)") : argv[0]);
