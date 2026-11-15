@@ -410,12 +410,27 @@ inline bool TypeCheck::HoldsIndexT(TypeExpr *t) {
 // `in pool` one into its named global pool, so a structure linked only by
 // those (a node pool) can never hold a reference into some other local.
 inline bool TypeCheck::HoldsPlainRef(TypeExpr *t) {
-    switch (t->kind) {
-        case TY_REF: return t->ref->lenstorage < 0;
-        case TY_SLICE: return true;
-        case TY_ARRAY: return HoldsPlainRef(t->arr->sub);
-        default: return AnyField(t, [&](TypeExpr *ft) { return HoldsPlainRef(ft); });
+    auto walk = [&] {
+        switch (t->kind) {
+            case TY_REF: return t->ref->lenstorage < 0;
+            case TY_SLICE: return true;
+            case TY_ARRAY: return HoldsPlainRef(t->arr->sub);
+            default: return AnyField(t, [&](TypeExpr *ft) { return HoldsPlainRef(ft); });
+        }
+    };
+    if (t->kind == TY_REF || t->kind == TY_SLICE) return walk();
+    // For a complete type graph the answer does not change (StableTypeQuery).
+    if (typesbuilding || !stabletypes.Ready(t)) return walk();
+    if (auto it = holdsplainref.find(t); it != holdsplainref.end()) {
+        if (verifynameunits && it->second != walk()) {
+            fprintf(stderr, "GOOSE_VERIFY_NAMEUNITS: HoldsPlainRef differs for %s\n", TypeStr(t).c_str());
+            abort();
+        }
+        return it->second;
     }
+    auto r = walk();
+    holdsplainref[t] = r;
+    return r;
 }
 
 // Whether a value of type t is meaningful as bytes on their own

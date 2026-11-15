@@ -1282,6 +1282,7 @@ struct TypeCheck {
     bool Reaches(TypeExpr *t, const function<bool(TypeExpr *)> &pred);
     bool HoldsIndexT(TypeExpr *t);
     bool HoldsPlainRef(TypeExpr *t);
+    unordered_map<TypeExpr *, bool> holdsplainref;   // For complete type graphs.
     bool HasDefault(TypeExpr *t, string &why);
 
     // Serialization (docs/design/serialization.md): what to_bytes will write
