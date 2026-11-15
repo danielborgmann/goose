@@ -21,6 +21,15 @@ A speed change must not change results. Before committing one:
    compared with the original computation and aborts on a difference. Run the suite and both
    workloads under it, and extend it for any new cache.
 
+## Split output
+
+`goose build --split` (`src/split.h`, and `BuildSplitUnits` in `src/build.h`) cuts the generated C
+into units after codegen, by its text; codegen itself is untouched. Check a change to it with
+`python tools/check_split.py <goose.exe> <workdir> -j 8 tools/split_fixtures/*.goose samples/*.goose test/codegen/*.goose ...`
+(builds each program both ways and compares what they print; it only builds programs that import
+gfx, ui or audio, since running them opens windows). Iterate on a few files; the full set of test
+folders takes about ten minutes.
+
 ## Build, workloads, profiling
 
 - Build: `cmake --build build/dev --config Release --parallel` (about a minute, MSVC). `build/` is

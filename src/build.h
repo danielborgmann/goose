@@ -19,6 +19,8 @@ struct BuildOptions {
     bool standalone = false;  // --standalone: no runtime object
     bool shared = false;      // --shared: build a self-contained shared library
     string exe;               // -o: the executable/library; "" puts it beside the root source
+    bool split = false;       // --split: the program's C as units (split.h), compiled apart and kept
+    int64_t splitkb = 128;    // About how much C a unit defines (GOOSE_SPLIT_KB)
 };
 
 inline string AbsolutePath(const string &path) {
@@ -182,7 +184,149 @@ struct Builder {
         }
         return Run(argv, cat("building ", exe), logfile);
     }
+
+    // Links the objects the response file `unitsrsp` names (a split
+    // program's units) with `objects` and the response files `rsps` into
+    // `exe`.
+    bool LinkObjects(const string &unitsrsp, const vector<string> &objects,
+                     const vector<string> &rsps, const string &exe, const string &builddir,
+                     const string &logfile) const {
+        vector<string> argv = { tc.cc };
+        for (auto &f : CFlags()) argv.push_back(f);
+        if (tc.style == "msvc") {
+            argv.push_back(cat("/Fe:", exe));
+            if (opts.debug) argv.push_back(cat("/Fd:", builddir, "\\", PathStem(exe), ".pdb"));
+            argv.push_back(cat("@", unitsrsp));
+            for (auto &o : objects) argv.push_back(o);
+            for (auto &r : rsps) argv.push_back(cat("@", r));
+        } else {
+            argv.push_back(cat("@", unitsrsp));
+            for (auto &o : objects) argv.push_back(o);
+            argv.push_back("-o");
+            argv.push_back(exe);
+            for (auto &r : rsps) argv.push_back(cat("@", r));
+            for (auto &l : SystemLibs()) argv.push_back(l);
+        }
+        return Run(argv, cat("linking ", exe), logfile);
+    }
 };
+
+// Compiles the units of a split program (split.h) that have no object yet,
+// side by side, under `builddir`: a unit's files are named by its name and
+// a hash of its C, so an object that exists is the object of that C, and
+// what no unit names any more is removed. Returns the response file naming
+// every unit's object, or "" when a unit failed, after saying how.
+inline string BuildSplitUnits(const Builder &b, const vector<SplitUnit> &units,
+                              const string &builddir) {
+    auto dir = cat(builddir, "/units/", b.tc.id, "-", b.opts.debug ? "debug" : "release");
+    auto objext = b.tc.style == "msvc" ? ".obj" : ".o";
+    struct Job {
+        const SplitUnit *unit;
+        string src, tmp, obj;
+        vector<string> argv;
+        ProcessResult r;
+        string problem;
+    };
+    vector<Job> jobs;
+    vector<string> objs;
+    set<string> stems;
+    std::error_code ec;
+    std::unique_ptr<FileLock> lock;
+    if (!b.opts.dryrun) {
+        filesystem::create_directories(filesystem::path(dir), ec);
+        if (ec) throw CompileError { cat("cannot create ", dir, ": ", ec.message()) };
+        lock.reset(new FileLock(cat(dir, "/build.lock"),
+                                "waiting for another goose building this program"));
+    }
+    for (auto &u : units) {
+        auto stem = cat(u.name, "-", Splitter::Hex(Splitter::Hash(u.text), 16));
+        auto obj = cat(dir, "/", stem, objext);
+        objs.push_back(obj);
+        stems.insert(stem);
+        if (!b.opts.dryrun && PathExists(obj)) continue;
+        Job j { &u, cat(dir, "/", stem, ".c"), cat(dir, "/", stem, ".tmp", objext), obj, { b.tc.cc }, {}, {} };
+        for (auto &f : b.CFlags()) j.argv.push_back(f);
+        if (b.tc.style == "msvc") {
+            j.argv.push_back("/c");
+            j.argv.push_back(j.src);
+            j.argv.push_back(cat("/Fo:", j.tmp));
+            if (b.opts.debug) j.argv.push_back(cat("/Fd:", obj, ".pdb"));
+        } else {
+            j.argv.push_back("-c");
+            j.argv.push_back(j.src);
+            j.argv.push_back("-o");
+            j.argv.push_back(j.tmp);
+        }
+        jobs.push_back(std::move(j));
+    }
+    auto rsp = cat(dir, "/units.rsp");
+    if (b.opts.dryrun || b.opts.verbose)
+        for (auto &j : jobs) fprintf(b.msgs, "%s\n", CommandLineText(j.argv).c_str());
+    if (b.opts.dryrun) return rsp;
+    // What an earlier build left that this one has no unit for.
+    for (auto &entry : filesystem::directory_iterator(filesystem::path(dir), ec)) {
+        auto name = entry.path().filename().string();
+        auto stem = name.substr(0, name.find('.'));
+        if (stem == "build" || stem == "units" || stem == "cc" || stems.count(stem)) continue;
+        std::error_code gone;
+        filesystem::remove(entry.path(), gone);
+    }
+    if (!jobs.empty()) {
+        fflush(b.msgs);
+        ProgressStep step(cat("compiling ", jobs.size(), " of ", units.size(), " C units"), true);
+        // The largest first: the longest compile bounds the wait.
+        std::sort(jobs.begin(), jobs.end(), [](const Job &x, const Job &y) {
+            return x.unit->text.size() > y.unit->text.size();
+        });
+        std::atomic<size_t> next { 0 };
+        auto work = [&] {
+            for (;;) {
+                auto i = next++;
+                if (i >= jobs.size()) return;
+                auto &j = jobs[i];
+                if (!WriteFileMakingDirs(j.src, j.unit->text)) { j.problem = cat("cannot write ", j.src); continue; }
+                std::error_code e;
+                filesystem::remove(filesystem::path(j.tmp), e);
+                j.r = RunProcess(j.argv, "", false);
+                if (!j.r.started || j.r.code) { j.problem = "failed"; continue; }
+                // Only a finished compile publishes the name later builds look for.
+                e = RenamePath(j.tmp, j.obj);
+                if (e) j.problem = cat("cannot publish ", j.obj, ": ", e.message());
+            }
+        };
+        vector<std::thread> pool;
+        auto n = std::min<size_t>(jobs.size(), std::max(1u, std::thread::hardware_concurrency()));
+        for (size_t i = 1; i < n; i++) pool.emplace_back(work);
+        work();
+        for (auto &t : pool) t.join();
+    }
+    string log;
+    size_t failed = 0;
+    for (auto &j : jobs) {
+        if (b.opts.verbose && !j.r.output.empty()) fprintf(b.msgs, "%s", j.r.output.c_str());
+        if (j.problem.empty()) continue;
+        Append(log, CommandLineText(j.argv), "\n", j.r.output, "\n");
+        // One unit's errors are enough to read; the log has the rest.
+        if (!failed++)
+            ProgressPrint(cat("compiling the C unit ", j.unit->name, " failed",
+                              j.r.started ? cat(" (exit ", j.r.code, ")") : string(), ":\n    ",
+                              CommandLineText(j.argv), "\n", j.problem == "failed" ? "" : j.problem,
+                              b.opts.verbose ? "" : j.r.output));
+    }
+    if (failed) {
+        WriteFileMakingDirs(cat(dir, "/cc.log"), log);
+        ProgressPrint(cat(failed, " C unit(s) failed (the output is in ", dir, "/cc.log)"));
+        return "";
+    }
+    string list;
+    for (auto &o : objs) {
+        auto path = o;
+        for (auto &c : path) if (c == '\\') c = '/';
+        Append(list, "\"", path, "\"\n");
+    }
+    if (!WriteFileMakingDirs(rsp, list)) throw CompileError { cat("cannot write ", rsp) };
+    return rsp;
+}
 
 // The runtime object for this toolchain and configuration, compiled from
 // `goose --emit-runtime`'s C on first use: GOOSE_HOME/build/runtime/<runtime
@@ -230,7 +374,8 @@ inline string RuntimeObject(const Builder &b) {
 // (`output`) or the root file. The exit code.
 inline int BuildExecutable(const string &rootfile, const string &cfile, const string &builddir,
                            const Toolchain &tc, const BuildOptions &opts, FILE *msgs,
-                           const vector<string> &nativersps, const string &output) {
+                           const vector<string> &nativersps, const string &output,
+                           const vector<SplitUnit> *units = nullptr) {
     Builder b { tc, opts, msgs };
     vector<string> objects;
     if (!opts.standalone) {
@@ -261,7 +406,14 @@ inline int BuildExecutable(const string &rootfile, const string &cfile, const st
         auto exedirpath = filesystem::path(exe).parent_path();
         if (!exedirpath.empty()) filesystem::create_directories(exedirpath, ec);
     }
-    if (!b.Link(cfile, objects, nativersps, exe, builddir, cat(builddir, "/cc.log"))) return 1;
+    if (units) {
+        auto unitsrsp = BuildSplitUnits(b, *units, builddir);
+        if (unitsrsp.empty()) return 1;
+        if (!b.LinkObjects(unitsrsp, objects, nativersps, exe, builddir, cat(builddir, "/cc.log")))
+            return 1;
+    } else if (!b.Link(cfile, objects, nativersps, exe, builddir, cat(builddir, "/cc.log"))) {
+        return 1;
+    }
     if (!opts.dryrun) fprintf(msgs, "built %s\n", exe.c_str());
     return 0;
 }
