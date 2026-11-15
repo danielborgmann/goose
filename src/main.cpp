@@ -693,6 +693,7 @@ R"(  --stats               Print what the compile did: the declarations parsed,
   --stacks              Report the data stacks the program and each worker can
                         take, and the cap that puts on hardware_threads().
   --no-bce              Keep every bounds check.
+  --no-unreached        Check only the functions the program reaches.
   --bce-lines           Report the bounds checks elided and kept on each line.
   --specs               Print the specializations of each function.
 )";
@@ -1373,6 +1374,7 @@ int Main(int argc, char **argv) {
     auto nocgen = false;
     auto roundtrip = false, multitest = false;
     auto nobce = false, bcetest = false, bcelines = false, norfcheck = false;
+    auto nounreached = false;
     auto stacks = false;
     auto stats = false;
     auto forcejit = false, standalone = false, shared = false;
@@ -1421,6 +1423,7 @@ int Main(int argc, char **argv) {
             }
         }
         else if (arg == "--no-bce") nobce = true;
+        else if (arg == "--no-unreached") nounreached = true;
         else if (arg == "--bce-test") bcetest = true;
         else if (arg == "--bce-lines") bcelines = true;
         // Unsound; a measurement aid only (see CodeGen::norfcheck).
@@ -1666,6 +1669,7 @@ int Main(int argc, char **argv) {
             if (stats) fprintf(msgs, "roundtrip ok: %d bytes of dump\n", (int)dumped.size());
         }
         if (parseonly) return 0;
+        ast.nounreached = nounreached;
         TypeCheckProgram(ast, library, nocgen);
         // The checker reported the errors it went on past, root by root.
         if (!ast.errors.empty()) return 1;

@@ -2544,6 +2544,9 @@ struct Ast {
     // Set by the language server: the checker gives each generic function
     // nothing instantiated an exemplar check (TypeCheck::CheckExemplars).
     bool exemplars = false;
+    // --no-unreached: a function no root reaches is not checked standalone
+    // (TypeCheck::CheckUnreached), so its errors go unreported.
+    bool nounreached = false;
 
     // Every `import` as a file wrote it, with the file it resolved to: what
     // a go to definition on the import line opens.

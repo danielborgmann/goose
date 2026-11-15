@@ -203,6 +203,7 @@ These options have the same meaning for `goose run`, `goose build`,
 | `--stacks` | Report how many data stacks the program and each of its workers use, what that adds up to, and the cap it puts on `hardware_threads()`. |
 | `--bce-lines` | Report, for each source line, how many bounds checks the compiler removed and how many it kept. |
 | `--no-bce` | Keep every bounds check. The program's `checkfree` functions are then not verified, and the compiler warns about that. |
+| `--no-unreached` | Check only the functions the program reaches. By default a function nothing calls is checked on its own, with each of its reference, slice and holder parameters rooted at a global of its own, so that its errors are reported too; that check can specialize again much of what it calls, all of it dead code. With this option those errors go unreported. The generated code is the same, less the type definitions only unreached functions used. |
 | `--specs` | Print every specialization of each function, after optimization, as source. |
 | `--stats` | Print a few lines about what the compile did: the declarations parsed, the specializations and optimizations, the bounds checks removed, and the files written. |
 | `--color auto\|always\|never` | Whether errors and warnings are in color ([§6](#6-what-goose-prints)). |

@@ -3214,8 +3214,11 @@ struct TypeCheck {
         // or holder parameter rooted at a global of its own, writable,
         // reusable where it could be).
         // Errors these produce are real; a lack of errors is weaker than for
-        // reached code, since no call-site facts were available.
-        for (size_t i = 0; i < ast.functions.size(); i++) {
+        // reached code, since no call-site facts were available. A function
+        // that takes a reference to a large structure and calls into code a
+        // root reached makes that code specialized again for its made-up
+        // global, all of it dead, which --no-unreached skips.
+        for (size_t i = 0; i < ast.functions.size() && !ast.nounreached; i++) {
             auto sf = ast.functions[i];
             CheckRoot([&] { CheckUnreached(sf); });
         }
