@@ -3342,9 +3342,15 @@ struct BCE {
         small_vector<Phi, 4> phis;
         for (auto &v : vals)
             if (named(a, v.ta.b) && named(b, v.tb.b)) phis.push_back(v);
+        // r.vgen is the merge of both sorted lists, so one pass finds each
+        // id's generation in a and in b.
+        size_t ai = 0, bi = 0;
+        auto &ag = a.vgen.gens, &bg = b.vgen.gens;
         for (auto &g : r.vgen.gens) {
-            auto ga = Base { BK_VAR, g.id, a.vgen.Get(g.id) };
-            auto gb = Base { BK_VAR, g.id, b.vgen.Get(g.id) };
+            while (ai < ag.size() && ag[ai].id < g.id) ai++;
+            while (bi < bg.size() && bg[bi].id < g.id) bi++;
+            auto ga = Base { BK_VAR, g.id, ai < ag.size() && ag[ai].id == g.id ? ag[ai].gen : 0 };
+            auto gb = Base { BK_VAR, g.id, bi < bg.size() && bg[bi].id == g.id ? bg[bi].gen : 0 };
             if (ga.gen != gb.gen && IntBaseVar(varof[g.id]) && named(a, ga) && named(b, gb))
                 phis.push_back({ Base { BK_VAR, g.id, g.gen }, { true, ga, 0 }, { true, gb, 0 } });
         }
