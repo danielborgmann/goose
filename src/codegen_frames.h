@@ -868,8 +868,7 @@ inline string CodeGen::ExpandTopMarkers1(const string &b, TopCachePlan &plan,
     // A region is the text between its loop's two markers, so a jump stays
     // inside it exactly when the line its label sits on does.
     vector<int> loopbeg(loopparent.size(), 0), loopend(loopparent.size(), 0);
-    vector<string> lbname;
-    vector<int> lbline;
+    unordered_map<string, int> lbline;   // A label's line.
     for (size_t i = 0, ind0 = 0, ln = 0; i < b.size(); ln++) {
         auto rest = NextLine(b, i, ind0);
         if (LineIs(rest, LOOPMARK)) {
@@ -877,8 +876,7 @@ inline string CodeGen::ExpandTopMarkers1(const string &b, TopCachePlan &plan,
             auto id = atoi(string(t.substr(1)).c_str());
             (t[0] == 'b' ? loopbeg : loopend)[id] = (int)ln;
         } else if (auto lb = LabelHere(rest); !lb.empty()) {
-            lbname.push_back(string(lb));
-            lbline.push_back((int)ln);
+            lbline[string(lb)] = (int)ln;
         }
     }
     vector<string> active = plan.fnlocals;   // Empty: the memory form here.
@@ -971,7 +969,7 @@ inline string CodeGen::ExpandTopMarkers1(const string &b, TopCachePlan &plan,
         }
         if (auto tgt = GotoTarget(rest); !tgt.empty()) {
             auto at = -1;
-            for (size_t j = 0; j < lbname.size(); j++) if (lbname[j] == tgt) at = lbline[j];
+            if (auto l = lbline.find(string(tgt)); l != lbline.end()) at = l->second;
             for (size_t k = 0; k < toporder.size(); k++) {
                 if (active[k].empty() || !plan.fnlocals[k].empty()) continue;
                 auto reg = -1;
@@ -997,9 +995,18 @@ inline string CodeGen::ExpandTopMarkers1(const string &b, TopCachePlan &plan,
             if (lenlocal[j].empty()) continue;
             auto &sl = lenslots[j];
             auto member = sl.lenlv.substr(sl.root.size(), sl.lenlv.size() - sl.root.size() - 3);
-            string nl;
-            for (size_t p = 0; p < line.size();) {
-                if (!occurs(line, p, sl.root)) { nl += line[p++]; continue; }
+            // Most lines do not mention the root at all.
+            auto first = line.find(sl.root);
+            if (first == string::npos) continue;
+            string nl(line, 0, first);
+            for (size_t p = first; p < line.size();) {
+                if (!occurs(line, p, sl.root)) {
+                    auto next = line.find(sl.root, p + 1);
+                    if (next == string::npos) next = line.size();
+                    nl.append(line, p, next - p);
+                    p = next;
+                    continue;
+                }
                 auto after = p + sl.root.size();
                 if (occurs(line, p, sl.lenlv)) {
                     nl += lenlocal[j];
