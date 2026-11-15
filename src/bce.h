@@ -896,6 +896,7 @@ struct BCE {
     // its index + 1, 0 when free. The nodes keep the order they were found
     // in, which the bounded relaxation below depends on.
     vector<int> distslots;
+    vector<int> meetslots;   // Meet's table of one flow's fact pairs.
 
     static uint64_t BaseHash(const Base &b) {
         auto h = ((uint64_t)b.kind << 56) ^ ((uint64_t)(uint32_t)b.id << 20) ^ (uint64_t)(uint32_t)b.gen;
@@ -3316,12 +3317,39 @@ struct BCE {
     // knows of it is only its axioms, which hold of the joined value anyway.
     Flow Meet(const Flow &a, const Flow &b, span<const Phi> vals = {}) {
         Flow r;
-        for (auto &f : a.facts)
-            for (auto &g : b.facts)
-                if (f.l == g.l && f.r == g.r) {
-                    r.facts.push_back({ f.l, f.r, std::max(f.c, g.c) });
-                    break;
+        // Each of a's facts against the first of b's on the same pair: by a
+        // hash of b's pairs where the flows are large.
+        if (a.facts.size() * b.facts.size() <= 256) {
+            for (auto &f : a.facts)
+                for (auto &g : b.facts)
+                    if (f.l == g.l && f.r == g.r) {
+                        r.facts.push_back({ f.l, f.r, std::max(f.c, g.c) });
+                        break;
+                    }
+        } else {
+            auto pairhash = [](const Fact &f) { return BaseHash(f.l) * 31 + BaseHash(f.r); };
+            size_t n = 16;
+            while (n < b.facts.size() * 2) n *= 2;
+            meetslots.assign(n, 0);
+            for (size_t i = 0; i < b.facts.size(); i++) {
+                auto &g = b.facts[i];
+                for (auto s = pairhash(g) & (n - 1);; s = (s + 1) & (n - 1)) {
+                    auto k = meetslots[s];
+                    if (!k) { meetslots[s] = (int)i + 1; break; }
+                    if (b.facts[k - 1].l == g.l && b.facts[k - 1].r == g.r) break;
                 }
+            }
+            for (auto &f : a.facts)
+                for (auto s = pairhash(f) & (n - 1);; s = (s + 1) & (n - 1)) {
+                    auto k = meetslots[s];
+                    if (!k) break;
+                    auto &g = b.facts[k - 1];
+                    if (f.l == g.l && f.r == g.r) {
+                        r.facts.push_back({ f.l, f.r, std::max(f.c, g.c) });
+                        break;
+                    }
+                }
+        }
         for (auto &l : a.lins)
             for (auto &k : b.lins)
                 if (l.tmp == k.tmp && l.x.b == k.x.b && l.x.off == k.x.off) {
