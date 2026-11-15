@@ -690,8 +690,9 @@ inline vector<SplitUnit> SplitProgram(CodeGen &cg, const string &pre, const stri
     // the one file: the split's cost at run time is mostly small helpers
     // called from everywhere. Not one whose address is taken (copies have
     // addresses of their own), one with a static local, or a simd variant.
-    // The limit is in bytes of C, GOOSE_SPLIT_INLINE (0: copy none).
-    size_t inlinemax = 1000;
+    // The limit is in bytes of C, GOOSE_SPLIT_INLINE (0: copy none). An edit
+    // to a helper copied everywhere recompiles the units that hold it.
+    size_t inlinemax = 4000;
     if (auto e = getenv("GOOSE_SPLIT_INLINE")) inlinemax = (size_t)atoll(e);
     if (inlinemax) {
         vector<bool> addressed(s.byname.size(), false);
