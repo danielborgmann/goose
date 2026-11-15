@@ -44,7 +44,9 @@ folders takes about ten minutes.
 - Profile: `tools/sampler/sampler.cpp` (build with `cl /O2 /EHsc /std:c++17 ... dbghelp.lib` after
   `vcvars64.bat`) run on a `RelWithDebInfo` build: `sampler -ms 40 -top 60 -o report.txt goose.exe
   check ...`. Time with the Release build at High priority; other sessions load the machine, so
-  compare runs made back to back.
+  compare runs made back to back. Batch every pending comparison into one `tools/bench.ps1` run
+  under one claim (it runs each variant in a block, so split units are not rebuilt between them);
+  correctness checks (C diffs, suites) need no claim.
 
 Upstream's own docs: `docs/implementation.md` (the checker, by section number as the code cites it),
 `docs/testing.md`, `docs/command_line.md`.
