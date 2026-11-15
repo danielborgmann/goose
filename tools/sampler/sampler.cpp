@@ -1,7 +1,9 @@
 // A small sampling profiler for Windows: starts a program at High priority (so the session's
 // background throttling does not distort it), samples every thread's stack, and prints the functions
 // by exclusive and by inclusive sample count. Needs the program's .pdb beside it.
-//   sampler [-ms N] [-top N] [-depth N] [-o report.txt] program args...
+//   sampler [-ms N] [-top N] [-depth N] [-callers name] [-o report.txt] program args...
+// -callers name also lists, for the samples inside a function whose name contains `name`, the first
+// frame outside the allocator and the C runtime above it (who allocates, for -callers "operator new").
 // -depth 1 samples only the running function (cheap, so -ms 1 gives many samples); deep stacks cost
 // ~0.1 s per sample on a compile that recurses thousands of frames.
 #include <windows.h>
@@ -38,12 +40,13 @@ static const std::string &NameOf(DWORD64 addr) {
 
 int main(int argc, char **argv) {
     int ms = 2, top = 60, a = 1, depth = 20000;
-    const char *out = nullptr;
+    const char *out = nullptr, *callers = nullptr;
     for (; a < argc && argv[a][0] == '-'; a++) {
         if (!strcmp(argv[a], "-ms") && a + 1 < argc) ms = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-top") && a + 1 < argc) top = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-depth") && a + 1 < argc) depth = atoi(argv[++a]);
         else if (!strcmp(argv[a], "-o") && a + 1 < argc) out = argv[++a];
+        else if (!strcmp(argv[a], "-callers") && a + 1 < argc) callers = argv[++a];
         else break;
     }
     if (a >= argc) { fprintf(stderr, "usage: sampler [-ms N] [-top N] [-o report.txt] program args...\n"); return 2; }
@@ -97,7 +100,7 @@ int main(int argc, char **argv) {
     DWORD code = 0;
     GetExitCodeProcess(proc, &code);
     // Resolve after the run. A sample whose innermost frame is a wait is an idle thread: dropped.
-    std::unordered_map<std::string, size_t> excl, incl;
+    std::unordered_map<std::string, size_t> excl, incl, by;
     size_t used = 0;
     for (auto &st : samples) {
         auto &leaf = NameOf(st[0]);
@@ -109,6 +112,23 @@ int main(int argc, char **argv) {
         for (auto pc : st) {
             auto &n = NameOf(pc);
             if (seen.insert(n).second) incl[n]++;
+        }
+        if (callers) {
+            // The first frame above the outermost one matching, skipping the allocator's own.
+            int at = -1;
+            for (int i = 0; i < (int)st.size(); i++) if (NameOf(st[i]).find(callers) != std::string::npos) at = i;
+            if (at >= 0) {
+                for (int i = at + 1; i < (int)st.size(); i++) {
+                    auto &n = NameOf(st[i]);
+                    if (n.find("operator new") != std::string::npos || n.find("_malloc") != std::string::npos ||
+                        n.find("_free") != std::string::npos || n.find("operator delete") != std::string::npos ||
+                        n.find("std::_") == 0 || n.find("std::allocator") != std::string::npos ||
+                        n.find("Rtl") == 0 || n.find("_Allocate") != std::string::npos)
+                        continue;
+                    by[n]++;
+                    break;
+                }
+            }
         }
     }
     FILE *f = out ? fopen(out, "w") : stdout;
@@ -123,6 +143,7 @@ int main(int argc, char **argv) {
     };
     print("EXCLUSIVE", excl);
     print("INCLUSIVE", incl);
+    if (callers) { std::string t = std::string("CALLERS OF ") + callers; print(t.c_str(), by); }
     if (f != stdout) fclose(f);
     return 0;
 }
