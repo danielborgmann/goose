@@ -48,6 +48,14 @@ folders takes about ten minutes.
   under one claim (it runs each variant in a block, so split units are not rebuilt between them);
   correctness checks (C diffs, suites) need no claim.
 
+## The published compiler
+
+Every project builds with `D:/Tools/FastGoose/dist/goose.exe` (its stdlib beside it), always the latest
+verified master. After each compiler commit that passes the bar above, build it and run
+`sh tools/publish.sh <goose.exe>`: it swaps the new exe and stdlib in by renames, so builds already
+running are not disturbed. Tell the projects only about changes that matter to them (generated C,
+a bug they'd hit, syntax), not about speed-only updates.
+
 ## README
 
 The section at the top of `README.md` is ours: what the fork is, its measured gains and how `--split`
