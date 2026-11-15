@@ -1283,6 +1283,7 @@ struct TypeCheck {
     bool HoldsIndexT(TypeExpr *t);
     bool HoldsPlainRef(TypeExpr *t);
     unordered_map<TypeExpr *, bool> holdsplainref;   // For complete type graphs.
+    unordered_map<TypeExpr *, vector<pair<TypeExpr *, bool>>> refslots;   // Likewise.
     bool HasDefault(TypeExpr *t, string &why);
 
     // Serialization (docs/design/serialization.md): what to_bytes will write

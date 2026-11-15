@@ -2636,17 +2636,38 @@ inline void TypeCheck::RefPointees(TypeExpr *t, vector<TypeExpr *> &out) {
 // whose binding says what the slot holds, rather than storage whose store
 // record says it (StoredSlotMayPointInto).
 inline void TypeCheck::RefSlots(TypeExpr *t, vector<pair<TypeExpr *, bool>> &out) {
-    switch (t->kind) {
-        case TY_REF:
-            if (t->ref->lenstorage < 0) {
-                auto st = LoadType(t->ref->sub);
-                out.push_back({ st, st->kind == TY_SLICE });
+    auto walk = [&](vector<pair<TypeExpr *, bool>> &into) {
+        switch (t->kind) {
+            case TY_REF:
+                if (t->ref->lenstorage < 0) {
+                    auto st = LoadType(t->ref->sub);
+                    into.push_back({ st, st->kind == TY_SLICE });
+                }
+                return;
+            case TY_SLICE: into.push_back({ t->sub, false }); return;
+            case TY_ARRAY: RefSlots(t->arr->sub, into); return;
+            default: EachField(t, [&](TypeExpr *ft) { RefSlots(ft, into); }); return;
+        }
+    };
+    if (t->kind == TY_REF || t->kind == TY_SLICE) return walk(out);
+    // For a complete type graph the answer does not change (StableTypeQuery).
+    if (typesbuilding || !stabletypes.Ready(t)) return walk(out);
+    if (auto it = refslots.find(t); it != refslots.end()) {
+        if (verifynameunits) {
+            vector<pair<TypeExpr *, bool>> again;
+            walk(again);
+            if (again != it->second) {
+                fprintf(stderr, "GOOSE_VERIFY_NAMEUNITS: RefSlots differs for %s\n", TypeStr(t).c_str());
+                abort();
             }
-            return;
-        case TY_SLICE: out.push_back({ t->sub, false }); return;
-        case TY_ARRAY: RefSlots(t->arr->sub, out); return;
-        default: EachField(t, [&](TypeExpr *ft) { RefSlots(ft, out); }); return;
+        }
+        out.insert(out.end(), it->second.begin(), it->second.end());
+        return;
     }
+    vector<pair<TypeExpr *, bool>> mine;
+    walk(mine);
+    out.insert(out.end(), mine.begin(), mine.end());
+    refslots[t] = std::move(mine);
 }
 
 // Whether a value of type t holds plain references or slices outside the
