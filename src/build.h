@@ -270,7 +270,12 @@ inline string BuildSplitUnits(const Builder &b, const vector<SplitUnit> &units,
         stems.insert(stem);
         if (!b.opts.dryrun && PathExists(obj)) continue;
         Job j { &u, cat(dir, "/", stem, ".c"), cat(dir, "/", stem, ".tmp", objext), obj, { b.tc.cc }, {}, {} };
-        for (auto &f : b.CFlags()) j.argv.push_back(f);
+        // The unit of gs_init_globals alone runs once, at startup, and
+        // optimizing its megabytes of initializers took clang-cl 6 s of a
+        // Netraider build after an edit to any global (unoptimized, 0.8 s).
+        auto once = u.name == "big_gs_init_globals";
+        for (auto &f : b.CFlags())
+            j.argv.push_back(!once ? f : f == "/O2" ? "/Od" : f == "-O2" ? "-O0" : f);
         if (b.SplitLTO()) j.argv.push_back("-flto=thin");
         if (b.tc.style == "msvc") {
             j.argv.push_back("/c");
