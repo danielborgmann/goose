@@ -1,3 +1,75 @@
+# This fork: a faster Goose compiler
+
+This is a fork of [aardappel/goose](https://github.com/aardappel/goose) that makes building Goose programs
+fast. It follows upstream `master`: each change sits on top of it as a small, self-contained commit
+that could go upstream as a pull request. Everything below this section is upstream's README.
+
+A speed change here must not change what the compiler produces. The generated C is byte-identical to
+upstream's on the programs we measure, the test suite gives the same result, and every cache can check
+itself (`GOOSE_VERIFY_NAMEUNITS=1` recomputes each cached answer and aborts on a difference).
+
+## Where the time went, and where it goes now
+
+Measured on two real programs: about 110k lines of Goose that become 1.04M lines of C, and about 65k
+lines that become 376k lines of C. Times are wall clock on one Windows laptop (clang-cl, 32 threads).
+
+| | Larger program, before | after | Smaller program, before | after |
+|---|---|---|---|---|
+| Goose check | 315 s | ~5.5 s | 19 s | ~2.2 s |
+| Full build, C included | ~6 min | ~1.5 min | ~70 s | 40 s (split) |
+| Build after a one-line edit | ~6 min | ~20-55 s | ~70 s | ~8 s |
+
+The check got faster through caches and better algorithms in the typechecker and bounds-check removal
+(memoized type queries, indexed store events, sorted merges at control-flow joins). It still checks
+the whole program on every build.
+
+## Split builds: `goose build --split`
+
+Upstream writes a program's C as one file. With `--split` the C is cut into a few hundred units of about
+128 KB (`GOOSE_SPLIT_KB`), compiled side by side, and each object is kept under a hash of its C, so
+after an edit only the units whose C changed are compiled again. Names in the generated C are derived
+from content, not from a running count, so an edit does not ripple into unrelated units.
+
+**Why a full split build is faster although it does more work.** Every unit repeats the type
+definitions it uses and the small functions it has copies of, so the total CPU time is higher. But a
+single C file compiles on one core, while the units compile on all of them; and parts of the optimizer
+cost more than linearly in the size of a file. The floor is the largest single function, which is a
+unit of its own.
+
+**Why a split build can run slower.** The C compiler sees one unit at a time:
+
+- It can inline only functions whose body is in the same unit. Small functions (up to 4000 bytes of C,
+  `GOOSE_SPLIT_INLINE`) are copied, `static`, into every unit that calls them to make up for this.
+  The price: an edit to a helper copied into most units recompiles most units.
+- Functions and globals have to be visible to other units, so the compiler can no longer specialize a
+  function for the arguments it is always given, drop unused parameters, or assume a global is never
+  written after startup.
+- The duplicated copies make the program larger and spread related code apart.
+
+On a large program this measured about 14% slower than the single file without the copies, and 4-8%
+slower with them. `GOOSE_SPLIT_LTO=1` (clang, experimental) compiles the units to ThinLTO bitcode and
+links them with lld, which inlines across all of them: within about 3% of the single file, but each
+edit's link takes longer. The practical setup is split builds while working, the single file for
+releases and benchmarks.
+
+The unit holding the startup code that gives every global its initial value is compiled without
+optimization: it runs once, and optimizing its megabytes of initializers took several seconds after
+any edit to a global.
+
+## Other additions
+
+| | |
+|---|---|
+| `--no-unreached` | Check only the functions the program reaches. By default an uncalled function is checked on its own, which can specialize again much of what it calls; this skips that, so its errors go unreported. The generated code is the same. |
+| `--stats` | Also prints how long each phase took (parse, check, optimize, bounds checks, codegen, emit, C compile, link). |
+| `tools/sampler` | A small Windows sampling profiler for compiler runs (exclusive and inclusive time, callers, time within a function). |
+| `tools/bench.ps1` | Times several compiler builds against each other, each in a block of runs. |
+| `tools/check_split.py` | Builds programs both ways and compares what they print. |
+
+See [docs/command_line.md](docs/command_line.md) for the options in full.
+
+---
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/logo/logo_white_fg_trans_bg_mini.png">
   <source media="(prefers-color-scheme: light)" srcset="docs/logo/logo_black_fg_white_bg_mini.png">

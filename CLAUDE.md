@@ -48,5 +48,11 @@ folders takes about ten minutes.
   under one claim (it runs each variant in a block, so split units are not rebuilt between them);
   correctness checks (C diffs, suites) need no claim.
 
+## README
+
+The section at the top of `README.md` is ours: what the fork is, its measured gains and how `--split`
+trades build time for run time. Keep it current when a change of ours lands, and never name the projects
+we build with it there ("a larger program", "a smaller program"). Upstream's README follows it unchanged.
+
 Upstream's own docs: `docs/implementation.md` (the checker, by section number as the code cites it),
 `docs/testing.md`, `docs/command_line.md`.
