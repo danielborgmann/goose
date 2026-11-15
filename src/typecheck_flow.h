@@ -604,12 +604,14 @@ inline VarDef *TypeCheck::RootComponent(VarDef *owner, TypeExpr *t, int field) {
             if (x && x->componentfield == field && TypeEq(x->componentbase, t)) return x;
         c = ast.NewVarDef();
         owner->components.push_back(c);
+        if (owner->isglobal) globalcomponents++;
     } else {
         owner->components.resize(si->ftypes.size(), nullptr);
         auto &slot = owner->components[field];
         if (!slot) {
             auto it = namedcomponents.find({ owner, si->st->fields[field].name });
             slot = it == namedcomponents.end() ? ast.NewVarDef() : it->second;
+            if (owner->isglobal) globalcomponents++;
         }
         c = slot;
     }

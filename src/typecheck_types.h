@@ -1371,9 +1371,9 @@ inline void TypeCheck::BoundReach(VarDef *r, vector<TypeExpr *> &out) {
 // says so (`unchecked`), and nothing is kept.
 inline const vector<VarDef *> *TypeCheck::GlobalCandidatesFor(TypeExpr *of) {
     if (typesbuilding) return nullptr;
-    size_t vars = 0;
-    for (auto g : ast.globals)
-        for (auto gd : g->defs) vars += 1 + gd->components.size();
+    // The globals' VarDefs all exist before any body is checked; only their
+    // components come later.
+    auto vars = globalcomponents;
     auto known = globalcandidates.find(of);
     if (known != globalcandidates.end() && known->second.vars == vars) return &known->second.list;
     if (!stabletypes.Ready(of)) return nullptr;

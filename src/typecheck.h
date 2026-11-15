@@ -1794,6 +1794,9 @@ struct TypeCheck {
         vector<VarDef *> list;
     };
     unordered_map<TypeExpr *, GlobalCandidates> globalcandidates;
+    // Components made for globals so far (RootComponent): a list made
+    // before the latest one may lack it.
+    size_t globalcomponents = 0;
     const vector<VarDef *> *GlobalCandidatesFor(TypeExpr *of);
 
     bool TempContents(const Val &v, ReadBack &contents);
