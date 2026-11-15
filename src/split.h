@@ -21,6 +21,35 @@ struct SplitUnit {
     string text;
 };
 
+// f(i) for i in [0, n), spread over the machine's threads: each call
+// touches only what belongs to its i.
+template<typename F> inline void SplitParallel(size_t n, F f) {
+    auto threads = std::min<size_t>(std::max(1u, std::thread::hardware_concurrency()), (n + 63) / 64);
+    if (threads <= 1) {
+        for (size_t i = 0; i < n; i++) f(i);
+        return;
+    }
+    std::atomic<size_t> next { 0 };
+    auto work = [&] {
+        for (;;) {
+            auto b = next.fetch_add(16);
+            if (b >= n) return;
+            for (auto i = b; i < std::min(n, b + 16); i++) f(i);
+        }
+    };
+    vector<std::thread> pool;
+    for (size_t t = 1; t < threads; t++) pool.emplace_back(work);
+    work();
+    for (auto &t : pool) t.join();
+}
+
+// A map from names that a string_view finds without making a string.
+struct SplitHash {
+    using is_transparent = void;
+    size_t operator()(string_view s) const { return std::hash<string_view>()(s); }
+};
+using SplitNames = unordered_map<string, string, SplitHash, std::equal_to<>>;
+
 struct Splitter {
     enum Kind { TYPE, MACRO, PROTO, INLINE, FN, DATA };
     struct Item {
@@ -39,8 +68,17 @@ struct Splitter {
     unordered_map<string_view, int> nameids;
     vector<vector<int>> byname;   // Name id -> the items declaring it.
 
-    static bool IdStart(char c) { return isalpha((unsigned char)c) || c == '_'; }
-    static bool IdChar(char c) { return isalnum((unsigned char)c) || c == '_'; }
+    // Bit 1: an identifier's first character, bit 2: one after it (as in
+    // the C locale).
+    static constexpr std::array<uint8_t, 256> idclass = [] {
+        std::array<uint8_t, 256> t {};
+        for (int c = 'a'; c <= 'z'; c++) t[c] = t[c - 'a' + 'A'] = 3;
+        for (int c = '0'; c <= '9'; c++) t[c] = 2;
+        t['_'] = 3;
+        return t;
+    }();
+    static bool IdStart(char c) { return idclass[(unsigned char)c] & 1; }
+    static bool IdChar(char c) { return idclass[(unsigned char)c] & 2; }
 
     // Calls f(begin, end) for each identifier of `t` outside string and
     // character literals and comments.
@@ -327,11 +365,11 @@ struct Splitter {
     }
 
     // `t` with each identifier `ren` knows replaced.
-    static string Renamed(string_view t, const unordered_map<string, string> &ren) {
+    static string Renamed(string_view t, const SplitNames &ren) {
         string out;
         size_t at = 0;
         EachIdent(t, [&](size_t b, size_t e) {
-            auto it = ren.find(string(t.substr(b, e - b)));
+            auto it = ren.find(t.substr(b, e - b));
             if (it == ren.end()) return;
             out.append(t.substr(at, b - at));
             out += it->second;
@@ -356,13 +394,13 @@ struct Splitter {
             }
             return "";
         };
-        unordered_map<string, string> ren;
+        SplitNames ren;
         unordered_set<string> taken;
         for (auto &it : items) {
             if (it.kind != DATA) continue;
             auto prefix = numbered(it.names[0]);
             if (prefix.empty()) continue;
-            unordered_map<string, string> self = { { it.names[0], "@" } };
+            SplitNames self = { { it.names[0], "@" } };
             auto body = Renamed(Renamed(it.defn, ren), self);
             auto h = Hash(body);
             auto name = cat(prefix, "_", Hex(h, 12));
@@ -399,9 +437,11 @@ struct Splitter {
                 locs[n] = { string(d.substr(b + 4, c - b - 4)), atoll(string(line).c_str()) };
             }
         }
-        vector<Item> added;
-        for (auto &it : items) {
-            if (it.kind != FN && it.kind != INLINE) continue;
+        vector<vector<Item>> addedby(items.size());
+        SplitParallel(items.size(), [&](size_t ii) {
+            auto &it = items[ii];
+            auto &added = addedby[ii];
+            if (it.kind != FN && it.kind != INLINE) return;
             string_view t = it.defn;
             // A base per source file: the function holds code inlined from
             // others, whose lines move with edits to those.
@@ -429,7 +469,7 @@ struct Splitter {
                     note(l->second.first, l->second.second);
                 }
             });
-            if (hits.empty()) continue;
+            if (hits.empty()) return;
             auto &fn = it.names[0];
             auto lbof = [&](const string &file, int64_t &base) {
                 for (size_t k = 0; k < bases.size(); k++)
@@ -454,7 +494,7 @@ struct Splitter {
                 Item d;
                 d.kind = DATA;
                 d.names = { lc->second };
-                d.defn = cat("const gs_loc ", lc->second, " = { ", locs[*h.loc].first, ", ", h.line, " };\n");
+                d.defn = cat("const gs_loc ", lc->second, " = { ", locs.at(*h.loc).first, ", ", h.line, " };\n");
                 d.decl = cat("extern const gs_loc ", lc->second, ";\n");
                 d.unit = "lines";
                 added.push_back(std::move(d));
@@ -471,34 +511,39 @@ struct Splitter {
                 d.unit = "lines";
                 added.push_back(std::move(d));
             }
-        }
-        for (auto &d : added) items.push_back(std::move(d));
+        });
+        for (auto &added : addedby)
+            for (auto &d : added) items.push_back(std::move(d));
         // The shared location objects no function names any more would still
         // be placed, by a name that changes with their line.
-        unordered_set<string> named;
-        for (auto &it : items) {
-            if (it.kind == DATA && Starts(it.names[0], "gs_loc_")) continue;
+        vector<vector<string_view>> namedby(items.size());
+        SplitParallel(items.size(), [&](size_t i) {
+            auto &it = items[i];
+            if (it.kind == DATA && Starts(it.names[0], "gs_loc_")) return;
             for (auto s : { &it.text, &it.decl, &it.defn }) {
                 string_view v = *s;
                 EachIdent(v, [&](size_t b, size_t e) {
-                    if (Starts(v.substr(b, e - b), "gs_loc_")) named.insert(string(v.substr(b, e - b)));
+                    if (Starts(v.substr(b, e - b), "gs_loc_")) namedby[i].push_back(v.substr(b, e - b));
                 });
             }
-        }
+        });
+        unordered_set<string> named;
+        for (auto &n : namedby) for (auto v : n) named.insert(string(v));
         items.erase(std::remove_if(items.begin(), items.end(), [&](const Item &it) {
             return it.kind == DATA && locs.count(it.names[0]) && !named.count(it.names[0]);
         }), items.end());
     }
 
     // Replaces the identifiers `ren` names in every item.
-    void Rename(const unordered_map<string, string> &ren) {
+    void Rename(const SplitNames &ren) {
         if (ren.empty()) return;
-        for (auto &it : items) {
+        SplitParallel(items.size(), [&](size_t i) {
+            auto &it = items[i];
             it.text = Renamed(it.text, ren);
             it.decl = Renamed(it.decl, ren);
             it.defn = Renamed(it.defn, ren);
             for (auto &n : it.names) if (auto r = ren.find(n); r != ren.end()) n = r->second;
-        }
+        });
     }
 
     void Link(string_view everywhere, vector<int> &everydeps, string_view hdr, vector<int> &hdrdeps) {
@@ -524,12 +569,13 @@ struct Splitter {
             out.erase(std::unique(out.begin(), out.end()), out.end());
             (void)self;
         };
-        for (auto &it : items) {
+        SplitParallel(items.size(), [&](size_t i) {
+            auto &it = items[i];
             scan(it.kind == FN || it.kind == DATA || it.kind == INLINE ? string_view(it.defn)
                                                                        : string_view(it.text),
                  it.deps, &it);
             if (!it.decl.empty()) scan(it.decl, it.decldeps, &it);
-        }
+        });
         scan(everywhere, everydeps, nullptr);
         scan(hdr, hdrdeps, nullptr);
     }
@@ -640,7 +686,7 @@ inline vector<SplitUnit> SplitProgram(CodeGen &cg, const string &pre, const stri
             while (e < h.size() && (h[e] == ' ' || h[e] == '\t')) e++;
             if (e < h.size() && h[e] == '(') called.insert(string(h.substr(b, e - b)));
         });
-        unordered_map<string, string> ren;
+        SplitNames ren;
         for (auto i = ext0; i < ext1; i++) {
             auto &it = s.items[i];
             if (it.kind != Splitter::PROTO || !called.count(it.names[0])) continue;
@@ -749,15 +795,17 @@ inline vector<SplitUnit> SplitProgram(CodeGen &cg, const string &pre, const stri
     if (!units.count("main")) units["main"];
     if (hasheaders) units["headers"];
 
-    vector<SplitUnit> out;
-    // 1: its declaration, 2: all of it, 3: a static copy of a function
-    // defined in another unit.
-    vector<uint8_t> need(items.size());
-    vector<pair<int, bool>> work;
-    vector<int> chosen;
-    for (auto &[name, mine] : units) {
-        std::fill(need.begin(), need.end(), 0);
-        chosen.clear();
+    vector<pair<const string *, const vector<int> *>> order;
+    for (auto &[name, mine] : units) order.push_back({ &name, &mine });
+    vector<SplitUnit> out(order.size());
+    SplitParallel(order.size(), [&](size_t k) {
+        auto &name = *order[k].first;
+        auto &mine = *order[k].second;
+        // 1: its declaration, 2: all of it, 3: a static copy of a function
+        // defined in another unit.
+        vector<uint8_t> need(items.size());
+        vector<pair<int, bool>> work;
+        vector<int> chosen;
         auto take = [&](int i, bool full) {
             // Only a definition's own unit holds more than its declaration,
             // but for the copies.
@@ -823,8 +871,8 @@ inline vector<SplitUnit> SplitProgram(CodeGen &cg, const string &pre, const stri
             for (auto &[other, _] : units) Append(t, "    gs_split_set_", other, "(s, n, gl);\n");
             t += "}\n";
         }
-        out.push_back(std::move(u));
-    }
+        out[k] = std::move(u);
+    });
     return out;
 }
 
