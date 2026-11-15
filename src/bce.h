@@ -726,9 +726,15 @@ struct BCE {
     // copied into ge0 and cands, of which a tree writes a handful.
     bool seedglobals = false;
 
+    // The candidates a walk found standing, while ValidateGlobalInvariants
+    // notes them: what its outcome may depend on.
+    vector<VarDef *> *relied = nullptr;
+
     bool GlobalCand(VarDef *v) {
         auto it = gge0.find(v);
-        return it != gge0.end() && it->second;
+        auto ok = it != gge0.end() && it->second;
+        if (ok && relied) relied->push_back(v);
+        return ok;
     }
     bool Ge0(VarDef *v) { return ge0.count(v) || (seedglobals && GlobalCand(v)); }
     // v's candidate state, made on its first write while validating the
@@ -886,12 +892,46 @@ struct BCE {
     // target, which is what relating a call's arguments pairwise needs. The
     // graph is the facts and the bases they name, few enough to sit in place.
     // With `rev`, the paths run the other way: from each base in `to` to `l`.
+    // DistsFrom's index of its nodes, kept between calls: a node's slot holds
+    // its index + 1, 0 when free. The nodes keep the order they were found
+    // in, which the bounded relaxation below depends on.
+    vector<int> distslots;
+
+    static uint64_t BaseHash(const Base &b) {
+        auto h = ((uint64_t)b.kind << 56) ^ ((uint64_t)(uint32_t)b.id << 20) ^ (uint64_t)(uint32_t)b.gen;
+        h *= 0x9E3779B97F4A7C15ull;
+        return h ^ (h >> 29);
+    }
+
     small_vector<int64_t, 4> DistsFrom(Base l, span<const Base> to, bool rev = false) {
         small_vector<Base, 16> nodes = { Zero(), l };
-        auto add = [&](const Base &b) {
-            for (auto &x : nodes) if (x == b) return;
-            nodes.push_back(b);
+        size_t cap = 64;
+        while (cap < 4 * (2 * flow.facts.size() + to.size() + 8)) cap *= 2;
+        distslots.assign(cap, 0);
+        auto find = [&](const Base &b, size_t &slot) {
+            for (slot = BaseHash(b) & (distslots.size() - 1);; slot = (slot + 1) & (distslots.size() - 1)) {
+                auto i = distslots[slot];
+                if (!i) return -1;
+                if (nodes[i - 1] == b) return i - 1;
+            }
         };
+        auto put = [&](size_t i) {
+            size_t slot;
+            if (find(nodes[i], slot) < 0) distslots[slot] = (int)i + 1;
+        };
+        auto add = [&](const Base &b) {
+            size_t slot;
+            if (find(b, slot) >= 0) return;
+            nodes.push_back(b);
+            if (2 * nodes.size() <= distslots.size()) {
+                distslots[slot] = (int)nodes.size();
+                return;
+            }
+            distslots.assign(distslots.size() * 2, 0);
+            for (size_t i = 0; i < nodes.size(); i++) put(i);
+        };
+        put(0);
+        put(1);   // l may be Zero(): the first of equal nodes is the one found.
         for (auto &b : to) add(b);
         for (auto &f : flow.facts) { add(f.l); add(f.r); }
         // Length bases of index and bound types' arrays.
@@ -911,8 +951,8 @@ struct BCE {
                         if (LeLenHolds(nodes[i], v, pid)) add(LenBase(pid));
             }
         auto idx = [&](const Base &b) {
-            for (size_t i = 0; i < nodes.size(); i++) if (nodes[i] == b) return (int)i;
-            return -1;
+            size_t slot;
+            return find(b, slot);
         };
         struct Edge { int a, b; int64_t w; };
         small_vector<Edge, 32> edges;
@@ -3639,22 +3679,62 @@ struct BCE {
             for (auto &[v, ok] : gge0) if (ok) return true;
             return false;
         };
-        for (auto dropped = true; dropped && live();) {
-            dropped = false;
-            SetupRootTrees();
-            ast.ForEachRootTree([&](Node *n) { dropped = check(n) || dropped; });
-            for (auto sp : ast.fnspecs) {
-                if (!sp->live || !sp->body) continue;
-                // Every write that can drop a candidate notes the global in
-                // the body's effect summary, so a body whose summary names
-                // none of the live candidates has nothing to check.
-                auto &writes = effects[sp].intvars;
-                auto here = false;
-                for (auto &[v, ok] : gge0) here = here || (ok && writes.count(v));
-                if (!here) continue;
-                SetupSpec(sp);
-                dropped = check(sp->body) || dropped;
+        // A walk's outcome depends on the candidates only through those it
+        // found standing, and candidates only fall, so a tree whose relied-on
+        // candidates all still stand would find what it found last round, and
+        // its drops are already made: it is walked again only once one of
+        // them has fallen. `full` walks every tree every round, as the rounds
+        // were first written; GOOSE_VERIFY_NAMEUNITS compares the two.
+        auto rounds = [&](bool full) {
+            map<Node *, vector<VarDef *>> reliedon;   // By tree walked.
+            auto stale = [&](Node *n) {
+                auto it = reliedon.find(n);
+                if (full || it == reliedon.end()) return true;
+                for (auto v : it->second) if (!GlobalCand(v)) return true;
+                return false;
+            };
+            auto walk = [&](Node *n) {
+                vector<VarDef *> mine;
+                relied = &mine;
+                auto dropped = check(n);
+                relied = nullptr;
+                std::sort(mine.begin(), mine.end());
+                mine.erase(std::unique(mine.begin(), mine.end()), mine.end());
+                reliedon[n] = std::move(mine);
+                return dropped;
+            };
+            for (auto dropped = true; dropped && live();) {
+                dropped = false;
+                SetupRootTrees();
+                ast.ForEachRootTree([&](Node *n) {
+                    if (stale(n)) dropped = walk(n) || dropped;
+                });
+                for (auto sp : ast.fnspecs) {
+                    if (!sp->live || !sp->body) continue;
+                    // Every write that can drop a candidate notes the global in
+                    // the body's effect summary, so a body whose summary names
+                    // none of the live candidates has nothing to check.
+                    auto &writes = effects[sp].intvars;
+                    auto here = false;
+                    for (auto &[v, ok] : gge0) here = here || (ok && writes.count(v));
+                    if (!here || !stale(sp->body)) continue;
+                    SetupSpec(sp);
+                    dropped = walk(sp->body) || dropped;
+                }
             }
+        };
+        if (getenv("GOOSE_VERIFY_NAMEUNITS")) {
+            auto seeds = gge0;
+            rounds(true);
+            auto want = gge0;
+            gge0 = seeds;
+            rounds(false);
+            if (gge0 != want) {
+                fprintf(stderr, "GOOSE_VERIFY_NAMEUNITS: global invariants differ\n");
+                abort();
+            }
+        } else {
+            rounds(false);
         }
         ge0.clear();
         cands.clear();
