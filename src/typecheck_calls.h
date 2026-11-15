@@ -2879,7 +2879,22 @@ inline void TypeCheck::CheckSpecBody(FnSpec *spec, vector<Val> *argvals, Line ca
         }
         cyclerounds.back().changed = false;
         auto readsbase = backreads.size();
-        CheckSpecBodyOnce(spec, argvals, callline, call);
+        auto errorsbase = ast.errors.size();
+        // The round an early stop skips reports nothing new either.
+        auto nothingnew = [&](const char *how) {
+            if (!verifyrepeat) return;
+            fprintf(stderr, "GOOSE_VERIFY_NAMEUNITS: the round after one that repeated its inputs "
+                            "%s in the cycle through %.*s\n",
+                    how, (int)spec->sf->name.size(), spec->sf->name.data());
+            abort();
+        };
+        try {
+            CheckSpecBodyOnce(spec, argvals, callline, call);
+        } catch (CompileError &) {
+            nothingnew("found an error");
+            throw;
+        }
+        if (ast.errors.size() != errorsbase) nothingnew("reported an error");
         for (auto &[cls, tc] : threadedclasses) broken -= tc.broken;
         auto outer = cyclerounds.back().changed;
         if (outer && getenv("GOOSE_ROUNDS"))
