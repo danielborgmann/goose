@@ -188,17 +188,31 @@ struct Builder {
     // Links the objects the response file `unitsrsp` names (a split
     // program's units) with `objects` and the response files `rsps` into
     // `exe`.
+    // GOOSE_SPLIT_LTO=1 (experimental): a split program's units are compiled
+    // to ThinLTO bitcode and linked by lld, which inlines across them, with a
+    // cache of its own under the units' directory. clang and clang-cl only.
+    bool SplitLTO() const {
+        auto e = getenv("GOOSE_SPLIT_LTO");
+        return e && *e && strcmp(e, "0") && (tc.name == "clang-cl" || tc.name == "clang");
+    }
+
     bool LinkObjects(const string &unitsrsp, const vector<string> &objects,
                      const vector<string> &rsps, const string &exe, const string &builddir,
-                     const string &logfile) const {
+                     const string &logfile, const string &ltocache = "") const {
         vector<string> argv = { tc.cc };
         for (auto &f : CFlags()) argv.push_back(f);
+        auto lto = !ltocache.empty();
+        if (lto) argv.push_back("-fuse-ld=lld");
         if (tc.style == "msvc") {
             argv.push_back(cat("/Fe:", exe));
             if (opts.debug) argv.push_back(cat("/Fd:", builddir, "\\", PathStem(exe), ".pdb"));
             argv.push_back(cat("@", unitsrsp));
             for (auto &o : objects) argv.push_back(o);
             for (auto &r : rsps) argv.push_back(cat("@", r));
+            if (lto) {
+                argv.push_back("/link");
+                argv.push_back(cat("/lldltocache:", ltocache));
+            }
         } else {
             argv.push_back(cat("@", unitsrsp));
             for (auto &o : objects) argv.push_back(o);
@@ -206,6 +220,7 @@ struct Builder {
             argv.push_back(exe);
             for (auto &r : rsps) argv.push_back(cat("@", r));
             for (auto &l : SystemLibs()) argv.push_back(l);
+            if (lto) argv.push_back(cat("-Wl,--thinlto-cache-dir=", ltocache));
         }
         return Run(argv, cat("linking ", exe), logfile);
     }
@@ -218,7 +233,8 @@ struct Builder {
 // every unit's object, or "" when a unit failed, after saying how.
 inline string BuildSplitUnits(const Builder &b, const vector<SplitUnit> &units,
                               const string &builddir) {
-    auto dir = cat(builddir, "/units/", b.tc.id, "-", b.opts.debug ? "debug" : "release");
+    auto dir = cat(builddir, "/units/", b.tc.id, "-", b.opts.debug ? "debug" : "release",
+                   b.SplitLTO() ? "-lto" : "");
     auto objext = b.tc.style == "msvc" ? ".obj" : ".o";
     struct Job {
         const SplitUnit *unit;
@@ -246,6 +262,7 @@ inline string BuildSplitUnits(const Builder &b, const vector<SplitUnit> &units,
         if (!b.opts.dryrun && PathExists(obj)) continue;
         Job j { &u, cat(dir, "/", stem, ".c"), cat(dir, "/", stem, ".tmp", objext), obj, { b.tc.cc }, {}, {} };
         for (auto &f : b.CFlags()) j.argv.push_back(f);
+        if (b.SplitLTO()) j.argv.push_back("-flto=thin");
         if (b.tc.style == "msvc") {
             j.argv.push_back("/c");
             j.argv.push_back(j.src);
@@ -409,7 +426,9 @@ inline int BuildExecutable(const string &rootfile, const string &cfile, const st
     if (units) {
         auto unitsrsp = BuildSplitUnits(b, *units, builddir);
         if (unitsrsp.empty()) return 1;
-        if (!b.LinkObjects(unitsrsp, objects, nativersps, exe, builddir, cat(builddir, "/cc.log")))
+        auto ltocache = b.SplitLTO() ? cat(builddir, "/units/lto-cache") : string();
+        if (!b.LinkObjects(unitsrsp, objects, nativersps, exe, builddir, cat(builddir, "/cc.log"),
+                           ltocache))
             return 1;
     } else if (!b.Link(cfile, objects, nativersps, exe, builddir, cat(builddir, "/cc.log"))) {
         return 1;
