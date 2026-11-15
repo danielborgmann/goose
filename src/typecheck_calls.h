@@ -2859,6 +2859,7 @@ inline void TypeCheck::CheckSpecBody(FnSpec *spec, vector<Val> *argvals, Line ca
         ~RoundScope() { tc.cyclerounds.pop_back(); }
     } roundscope(*this);
     CheckSpecBodyOnce(spec, argvals, callline, call);
+    auto verifyrepeat = false;
     while (spec->incycle && CycleHead(spec) == spec) {
         // Bound cycles that do not settle. Completion proofs accumulate, but
         // pruning a newly unreachable continuation can remove other effects.
@@ -2877,6 +2878,7 @@ inline void TypeCheck::CheckSpecBody(FnSpec *spec, vector<Val> *argvals, Line ca
             m->stale = m != spec;
         }
         cyclerounds.back().changed = false;
+        auto readsbase = backreads.size();
         CheckSpecBodyOnce(spec, argvals, callline, call);
         for (auto &[cls, tc] : threadedclasses) broken -= tc.broken;
         auto outer = cyclerounds.back().changed;
@@ -2884,10 +2886,37 @@ inline void TypeCheck::CheckSpecBody(FnSpec *spec, vector<Val> *argvals, Line ca
             fprintf(stderr, "round %d of %.*s: a variable outside it changed\n", spec->rounds,
                     (int)spec->sf->name.size(), spec->sf->name.data());
         auto settled = broken == 0 && bounds == threadbounds && !outer;
+        auto clean = settled;
         for (auto m : members)
             if (!m->stale) settled = settled && SameRecord(m->record, *m->prev, m);
+        if (verifyrepeat && !settled) {
+            fprintf(stderr, "GOOSE_VERIFY_NAMEUNITS: the round after one that repeated its inputs "
+                            "changed the cycle through %.*s\n",
+                    (int)spec->sf->name.size(), spec->sf->name.data());
+            abort();
+        }
+        // A round whose calls back into the cycle read only records it then
+        // remade the same gives the next round the inputs it had itself, so
+        // that round would only repeat it: the cycle has settled on this one.
+        auto repeats = false;
+        if (!settled && clean && spec->cyclemembers.size() == members.size()) {
+            vector<const FnSpec *> reads(backreads.begin() + (ptrdiff_t)readsbase, backreads.end());
+            sort(reads.begin(), reads.end());
+            reads.erase(unique(reads.begin(), reads.end()), reads.end());
+            repeats = true;
+            for (auto r : reads) {
+                auto m = const_cast<FnSpec *>(r);
+                repeats = repeats && find(members.begin(), members.end(), m) != members.end() &&
+                          m->prev && !m->stale && SameRecord(m->record, *m->prev, m);
+            }
+        }
+        if (cyclerounds.size() == 1) backreads.clear();
         for (auto m : members) m->prev = nullptr;
         if (settled) break;
+        if (repeats) {
+            if (!verifynameunits) break;
+            verifyrepeat = true;
+        }
     }
     if (spec->incycle && CycleHead(spec) == spec) ShareCycleEnvReads(spec);
 }

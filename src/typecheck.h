@@ -2452,10 +2452,15 @@ struct TypeCheck {
     void AddNeed(FnSpec *s, FnSpec *t);
     // The record of a callee a call reads: the callee's own once it is
     // checked, the round before's while it is in progress (a back edge), and
-    // none in a cycle's first round.
-    static const FnRecord *RecordOf(const FnSpec *spec) {
-        return spec->inprogress ? spec->prev.get() : &spec->record;
+    // none in a cycle's first round. A back edge read during a round is
+    // noted, for the round's head to see which records it depended on
+    // (CheckSpecBody).
+    const FnRecord *RecordOf(const FnSpec *spec) {
+        if (!spec->inprogress) return &spec->record;
+        if (!cyclerounds.empty()) backreads.push_back(spec);
+        return spec->prev.get();
     }
+    vector<const FnSpec *> backreads;
     void CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Line callline,
                            Call *call = nullptr);
     bool SameRecord(const FnRecord &a, const FnRecord &b, const FnSpec *spec);

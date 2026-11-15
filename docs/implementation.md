@@ -3159,6 +3159,13 @@ it:
   every level of a nested function's recursion, which a round may have
   read for the next level before it rebound it.
 
+A round that meets the last two conditions but changed some records is
+also the last when every record its back edges read (noted by `RecordOf`)
+is a member's, and it remade that record the same: the next round would
+read exactly the records this one read, so it would only repeat it.
+`GOOSE_VERIFY_NAMEUNITS` runs that next round anyway and aborts if it
+changes the cycle.
+
 Completion proofs accumulate, but pruning a newly unreachable continuation
 can remove other effects. An internal limit of 8 rounds stops a cycle that
 does not settle.
