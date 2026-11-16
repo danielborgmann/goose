@@ -16,6 +16,14 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     exit 1
 fi
 [ -f "$exe" ] || { echo "publish: no $exe" >&2; exit 1; }
+# The exe must be built from this very commit, with nothing uncommitted.
+ver=$("$exe" --version)
+case "$ver" in *-dirty*) echo "publish: $exe was built from uncommitted code ($ver)" >&2; exit 1 ;; esac
+built=$(echo "$ver" | sed -n 's/.*-g\([0-9a-f]*\).*/\1/p')
+case "$(git rev-parse HEAD)" in
+    "$built"?*) ;;
+    *) echo "publish: $exe is not built from HEAD ($ver); rebuild it" >&2; exit 1 ;;
+esac
 v=dist/v/$sha
 rm -rf "${v:?}.tmp"
 mkdir -p "$v.tmp"
