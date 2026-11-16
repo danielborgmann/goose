@@ -14,7 +14,10 @@ A speed change must not change results. Before committing one:
 
 1. `python test/run_tests.py --exe <goose.exe> -j 10` gives the same result as the unmodified
    baseline (about 2 minutes; one test, `bce_wrapped_declaration` at -O2, fails on this machine on
-   upstream master too).
+   upstream master too: the suite's cl is MSVC 19.38, whose /O2 drops that bounds check, an MSVC bug
+   fixed in 19.44, which is installed; vcvars64 picks 14.38 because
+   `Microsoft.VCToolsVersion.v143.default.txt` still names it. Goose's C is correct; clang-cl, the
+   default for `goose build`, is unaffected).
 2. The generated C of both workloads is byte-identical to the baseline's (`goose file.goose -o out.c`,
    then `cmp`).
 3. A cache keeps a way to check itself: `GOOSE_VERIFY_NAMEUNITS=1` makes each cached answer be
