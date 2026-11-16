@@ -347,7 +347,10 @@ class CC:
             argv += ["/LD", *map(str, sources), f"/Fe:{out}", f"/Fo:{out.parent}{os.sep}"]
         else:
             argv += [f"-I{i}" for i in includes]
-            argv += ["-shared", "-fPIC", *map(str, sources), "-o", str(out)]
+            # Windows code is position independent already, and clang there
+            # refuses the flag for its msvc target.
+            argv += ["-shared", *([] if IS_WINDOWS else ["-fPIC"]), *map(str, sources),
+                     "-o", str(out)]
         r = subprocess.run(argv, capture_output=True, text=True, errors="replace")
         return r.returncode == 0, (r.stdout or "") + (r.stderr or "")
 
