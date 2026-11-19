@@ -376,6 +376,23 @@ fn each_chunk<T, F>(xs: T[:], n: i64) {
     }
 }
 
+// The k-th of n contiguous runs of xs, which cover it in order; their lengths
+// differ by at most one, the longer ones first. Distinct k give disjoint
+// runs, which is what a `par for k in n` relies on (child_threads.md §4.4).
+fn chunk<T>(xs: T[:], k: i64, n: i64) -> T[:] {
+    assert(n > 0 && k >= 0 && k < n);
+    let q = xs.len / n;
+    let r = xs.len % n;
+    return xs[k * q + min(k, r)..(k + 1) * q + min(k + 1, r)];
+}
+
+// xs[bounds[k]..bounds[k + 1]], for bounds that are non-decreasing and
+// within xs (a partition's start offsets, with xs.len last).
+fn chunk_at<T>(xs: T[:], bounds: const i64[:], k: i64) -> T[:] {
+    assert(k >= 0 && k + 1 < bounds.len);
+    return xs[bounds[k]..bounds[k + 1]];
+}
+
 // The first x with F(x), as a reference into xs; null if none.
 fn find<T, F>(xs: T[:]) -> T? {
     for &x in xs { if F(x) { return x; } }

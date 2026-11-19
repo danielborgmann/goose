@@ -225,6 +225,21 @@ fn searching() {
     var empty_chunks = 0; // empty slice, run 0 times
     each_chunk(xs[..0], 2) { c, i => empty_chunks += 1; };
     assert(empty_chunks == 0);
+    var ys = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    print(ys.chunk(0, 4), " ", ys.chunk(3, 4));                                // [0, 1, 2] [8, 9]
+    for &y in ys.chunk(1, 3) { y = 0 - y; }
+    print(ys);                                                                 // [0, 1, 2, 3, -4, -5, -6, 7, 8, 9]
+    let bounds = [0, 0, 3, 10];
+    print(ys.chunk_at(bounds, 0).len, " ", ys.chunk_at(bounds, 2).len);        // 0 7
+    var covered = 0;  // every n's chunks cover ys exactly, lengths within one
+    for n in 1..13 {
+        for k in n {
+            let c = ys.chunk(k, n);
+            assert(c.len == ys.len / n || c.len == ys.len / n + 1);
+            covered += c.len;
+        }
+    }
+    print(covered, " ", ys[..0].chunk(1, 2).len);                               // 120 0
     let f = find(xs) { it > 6 };
     if f { print(f); }                                                         // 9
     print(find_index(xs) { it == 1 }, " ", find_index(xs) { it == 2 });        // 3 -1
