@@ -2111,6 +2111,33 @@ def main():
                     r.ok(f"host {name}")
         r.show_task(host_exit)
 
+        # FastGoose's par for (tools/par_for.md): each program forks, and
+        # prints its expected output on one thread and on the pool.
+        def par_for_threads(f):
+            name = f.stem
+            cfile = gendir / f"par-{name}.c"
+            code, out, err = r.goose("-O2", "-o", cfile, f)
+            if code != 0:
+                r.fail(f"par for cgen {f.name}", out + err)
+                return
+            if "gs_par(gs_parthunk" not in cfile.read_text(encoding="utf-8"):
+                r.fail(f"par for {f.name}", "no par for forks")
+                return
+            out_exe = gendir / f"par-{name}{tc.EXE_SUFFIX}"
+            ok, log = cc.compile(cfile, out_exe, opt=2, extra=extra, strict_decls=True,
+                                 runtime=r.runtime, log=gendir / f"par-{name}.cc.log")
+            if not ok:
+                r.fail(f"par for cc {f.name}", "\n".join(log.splitlines()[:8]))
+                return
+            for threads in ("1", ""):
+                label = f"par for {f.name} GOOSE_THREADS={threads or 'cores'}"
+                env = dict(os.environ, GOOSE_THREADS=threads)
+                out = r.check_run(name, label, *tc.run_capture([out_exe], env=env))
+                if out is not None and r.check_stdout(name, label, out):
+                    r.ok(label)
+        for f in sorted((HERE / "codegen").glob("par_for*.goose")):
+            r.show_task(par_for_threads, f)
+
         # The same coverage test through clang, release and debug. A compiler
         # that accepts more C than the standard does is not what checks the
         # generated C is actually valid: a call to a function defined only in

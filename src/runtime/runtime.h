@@ -101,6 +101,11 @@ typedef double gs_f64 GS_ALIGN1;
 #define GS_DL_CALL
 #endif
 
+/* A program with a par for forks on threads, but not in a JIT run, whose
+   TinyCC places no thread-locals (tools/par_for.md). */
+#if defined(GS_PAR) && !defined(GS_NEED_THREADS) && !defined(GS_EMBEDDED_JIT)
+#define GS_NEED_THREADS 1
+#endif
 #ifndef GS_NEED_THREADS
 #define GS_NEED_THREADS 0
 #endif
@@ -976,6 +981,11 @@ GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
 GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
                                const char *file, int line);
 GS_API void gs_free_msg(uint8_t *msg);
+/* A par for's fork: runs f(env, a, b) over chunks [a, b) of [lo, hi), on the
+   pool's threads and this one, and returns when all have run; or runs f(env,
+   lo, hi) here (runtime_threads.h says when). */
+typedef void (*gs_par_fn)(void *env, int64_t lo, int64_t hi);
+GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi);
 
 /* One queue per flat element type the program uses (the compiler emits a
    gs_queue global per type, which main sets up before anything can use it).
@@ -1072,6 +1082,16 @@ static int64_t gs_thread_spawn(void (*entry)(uint8_t *), const void *args, int64
     return gs_thread_start(gs_thread_run, gs_thread_release, entry, args, argsize, contained);
 }
 #endif
+
+/* A par for's fork, whose chunks the generated thunk runs after taking this
+   thread program's stack block and globals instance. */
+static inline void gs_par(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
+#if GS_NEED_THREADS
+    gs_par_run(f, env, lo, hi);
+#else
+    f(env, lo, hi);
+#endif
+}
 
 #endif  /* GS_RUNTIME_OBJECT */
 

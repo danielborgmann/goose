@@ -4,6 +4,9 @@ This is a fork of [aardappel/goose](https://github.com/aardappel/goose) that mak
 fast. It follows upstream `master`: each change sits on top of it as a small, self-contained commit
 that could go upstream as a pull request. Everything below this section is upstream's README.
 
+It also adds one language feature that upstream does not have yet, `par for` (below). Code that uses it
+builds only with this compiler.
+
 A speed change here must not change what the compiler produces. The generated C is byte-identical to
 upstream's on the programs we measure, the test suite gives the same result, and every cache can check
 itself (`GOOSE_VERIFY_NAMEUNITS=1` recomputes each cached answer and aborts on a difference).
@@ -56,10 +59,40 @@ The unit holding the startup code that gives every global its initial value is c
 optimization: it runs once, and optimizing its megabytes of initializers took several seconds after
 any edit to a global.
 
+## `par for`: parallel loops (this fork's, not upstream's)
+
+An implementation of the loops in upstream's design note
+[docs/design/child_threads.md](docs/design/child_threads.md), in its syntax, for programs that cannot
+wait for upstream's own version; when that lands we follow it. Each iteration may read anything and
+write only what is its own; the compiler checks this, so a loop that compiles gives the same result on
+any number of threads. The one gap, which the note accepts: two variables that are views of the same
+array, one written as the iteration's own and the other read, are not told apart.
+
+```goose
+par for i in n { out[i] = f(xs[i]); }                 // out[i] is this iteration's element
+par for &x, i in xs { x = x * 2 + i; }               // so is each x of xs
+par for k in parts {                                  // a contiguous run of out per k
+    for &v in out.chunk(k, parts) { v = k; }
+}
+```
+
+- An array of the enclosing function that the body reaches only as `out[i]` (with `i` the loop's
+  index), `out.chunk(i, n)` or `out.chunk_at(bounds, i)` is the iteration's own to write. Every other
+  variable of the enclosing function is read-only in the body.
+- The body cannot print, exit, use threads or queues, write a global, or call an extern outside the
+  standard library's pure ones, directly or through what it calls. It cannot `return` or `break` out
+  of the loop; `continue` ends one iteration.
+- The iterations run in chunks on a pool of threads (`GOOSE_THREADS`, by default one per CPU) that
+  the first loop starts. A loop inside a loop's body, a loop in a contained worker, and every loop
+  under `GOOSE_THREADS=1` or `goose run` run as plain loops. So, for now, does a body that needs a
+  data stack (a growable local); bodies like that are the note's next step.
+- `bench/fork_cost/par_cost.goose` measures what a fork and join costs.
+
 ## Other additions
 
 | | |
 |---|---|
+| `chunk`, `chunk_at` | In `std`: `xs.chunk(k, n)` is the k-th of n contiguous runs of a slice, `xs.chunk_at(bounds, k)` the run between two offsets. |
 | `--no-unreached` | Check only the functions the program reaches. By default an uncalled function is checked on its own, which can specialize again much of what it calls; this skips that, so its errors go unreported. The generated code is the same. |
 | `--stats` | Also prints how long each phase took (parse, check, optimize, bounds checks, codegen, emit, C compile, link). |
 | `tools/sampler` | A small Windows sampling profiler for compiler runs (exclusive and inclusive time, callers, time within a function). |

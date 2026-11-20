@@ -634,7 +634,7 @@ inline vector<string> CodeGen::EmitSpecCall(Call *c, FnSpec *sp, Dst d0, vector<
         auto r0 = T();
         L(CT(sp->rets[ki.cret]), " ", r0, " = ", callee, "(", argstr, ");");
         retex[ki.cret] = r0;
-    } else {
+    } else if (!ername.empty() || !EmitParFork(sp, args)) {
         L(callee, "(", argstr, ");");
     }
     MarkReload(reach);

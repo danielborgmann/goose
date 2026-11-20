@@ -799,6 +799,7 @@ struct Inliner {
 inline Node *Optimizer::TryInline(Call *c) {
     if (!caninline || !c->spec || c->builtin >= 0 || !c->dispatch.empty()) return nullptr;
     auto K = c->spec;
+    if (K->sf->par) return nullptr;  // The call forks (par_for.h).
     auto &info = inlineinfo[K];
     if (!K->live || !K->body) return nullptr;
     auto ncuhere = loopdepth > 0 && !colddepth ? ncu * LOOPNCU : ncu;

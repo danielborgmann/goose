@@ -123,7 +123,12 @@ R"GSRT(/* The function a dynamic extern is called through (§7.10). Its pointer 
 #endif
 
 )GSRT"
-R"GSRT(#ifndef GS_NEED_THREADS
+R"GSRT(/* A program with a par for forks on threads, but not in a JIT run, whose
+   TinyCC places no thread-locals (tools/par_for.md). */
+#if defined(GS_PAR) && !defined(GS_NEED_THREADS) && !defined(GS_EMBEDDED_JIT)
+#define GS_NEED_THREADS 1
+#endif
+#ifndef GS_NEED_THREADS
 #define GS_NEED_THREADS 0
 #endif
 #ifndef GS_DEBUG
@@ -1063,6 +1068,11 @@ GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
 GS_API uint8_t gs_thread_wait(int64_t id, uint8_t **msg, int64_t *len,
                                const char *file, int line);
 GS_API void gs_free_msg(uint8_t *msg);
+/* A par for's fork: runs f(env, a, b) over chunks [a, b) of [lo, hi), on the
+   pool's threads and this one, and returns when all have run; or runs f(env,
+   lo, hi) here (runtime_threads.h says when). */
+typedef void (*gs_par_fn)(void *env, int64_t lo, int64_t hi);
+GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi);
 
 )GSRT"
 R"GSRT(/* One queue per flat element type the program uses (the compiler emits a
@@ -1173,6 +1183,17 @@ R"GSRT(static int64_t gs_thread_spawn(void (*entry)(uint8_t *), const void *args
     return gs_thread_start(gs_thread_run, gs_thread_release, entry, args, argsize, contained);
 }
 #endif
+
+)GSRT"
+R"GSRT(/* A par for's fork, whose chunks the generated thunk runs after taking this
+   thread program's stack block and globals instance. */
+static inline void gs_par(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
+#if GS_NEED_THREADS
+    gs_par_run(f, env, lo, hi);
+#else
+    f(env, lo, hi);
+#endif
+}
 
 )GSRT"
 R"GSRT(#endif  /* GS_RUNTIME_OBJECT */
@@ -3833,6 +3854,211 @@ GS_API void gs_qfree(gs_queue *q) {
 }
 
 )GSRT"
+R"GSRT(/* ---------------------------------------------------------------------------
+   The par for pool (FastGoose's tools/par_for.md, after upstream's
+   docs/design/child_threads.md). A fork runs f(env, a, b) over chunks [a, b)
+   of [lo, hi): the forking thread and the pool's threads claim chunks until
+   none is left, and the fork returns once every chunk has run. A chunk is
+   claimed through one word holding the fork's number, its chunk count and the
+   next chunk, so a thread that comes late to a fork that has ended claims
+   nothing, and the job's fields are read only by a thread that has claimed a
+   chunk of it, which the fork outlives. Pool threads spin a while for the
+   next fork, then sleep. One fork runs at a time; a fork while another runs,
+   one inside a fork's body, one in a contained worker and every one under
+   GOOSE_THREADS=1 run sequentially. */
+
+)GSRT"
+R"GSRT(#ifdef _WIN32
+#define gs_par_load(p)          InterlockedCompareExchange64((p), 0, 0)
+#define gs_par_store(p, v)      InterlockedExchange64((p), (v))
+#define gs_par_cas(p, old, nw)  (InterlockedCompareExchange64((p), (nw), (old)) == (old))
+#define gs_par_add(p, v)        InterlockedExchangeAdd64((p), (v))
+#define gs_par_pause()          YieldProcessor()
+#define gs_par_yield()          SwitchToThread()
+#else
+#include <sched.h>
+#define gs_par_load(p)          __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#define gs_par_store(p, v)      __atomic_store_n((p), (v), __ATOMIC_SEQ_CST)
+#define gs_par_add(p, v)        __atomic_fetch_add((p), (v), __ATOMIC_SEQ_CST)
+static int gs_par_cas(volatile int64_t *p, int64_t old, int64_t nw) {
+    return __atomic_compare_exchange_n(p, &old, nw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+#if defined(__x86_64__) || defined(__i386__)
+#define gs_par_pause()          __builtin_ia32_pause()
+#elif defined(__aarch64__)
+#define gs_par_pause()          __asm__ __volatile__("yield")
+#else
+#define gs_par_pause()          ((void)0)
+#endif
+#define gs_par_yield()          sched_yield()
+#endif
+
+)GSRT"
+R"GSRT(#define GS_PAR_SPIN 4096        /* Pauses a pool thread waits for a fork before it sleeps. */
+#define GS_PAR_CHUNKS 4         /* Chunks per thread, for the uneven loops. */
+
+)GSRT"
+R"GSRT(static struct {
+    gs_par_fn f;
+    void *env;
+    int64_t lo, n;
+} gs_par_job;
+static volatile int64_t gs_par_claim;     /* fork << 32 | chunks << 16 | next chunk */
+static volatile int64_t gs_par_done;      /* The fork's chunks that have run. */
+static volatile int64_t gs_par_busy;      /* A fork is running. */
+static volatile int64_t gs_par_sleepers;  /* Pool threads waiting on gs_par_wake. */
+static volatile int64_t gs_par_live;      /* Pool threads running. */
+static volatile int64_t gs_par_quit;
+static int64_t gs_par_forks;
+static int64_t gs_par_threads;            /* The forking thread and the pool's; 0 until the first fork. */
+static gs_mutex gs_par_mutex = GS_MUTEX_INIT;
+static gs_cond gs_par_wake = GS_COND_INIT;
+static GS_TLS int gs_in_par;              /* In a fork's body: a fork here runs sequentially. */
+
+)GSRT"
+R"GSRT(/* Runs chunks of fork `fork` until none is left to claim. */
+static void gs_par_chunks(int64_t fork) {
+    for (;;) {
+        int64_t c = gs_par_load(&gs_par_claim);
+        int64_t k = c & 0xffff, chunks = c >> 16 & 0xffff;
+        if (c >> 32 != fork || k >= chunks) return;
+        if (!gs_par_cas(&gs_par_claim, c, c + 1)) continue;
+        int64_t q = gs_par_job.n / chunks, r = gs_par_job.n % chunks;
+        int64_t a = gs_par_job.lo + k * q + (k < r ? k : r);
+        int64_t b = a + q + (k < r);
+        gs_par_job.f(gs_par_job.env, a, b);
+        gs_par_add(&gs_par_done, 1);
+    }
+}
+
+)GSRT"
+R"GSRT(#ifdef _WIN32
+static DWORD WINAPI gs_par_main(LPVOID p)
+#else
+static void *gs_par_main(void *p)
+#endif
+{
+    (void)p;
+    gs_native_stack_init();
+    gs_in_par = 1;
+    int64_t seen = 0;
+    while (!gs_par_load(&gs_par_quit)) {
+        int64_t fork = gs_par_load(&gs_par_claim) >> 32;
+        if (fork != seen) {
+            seen = fork;
+            gs_par_chunks(fork);
+            continue;
+        }
+        int spun = 0;
+        while (spun < GS_PAR_SPIN && gs_par_load(&gs_par_claim) >> 32 == seen &&
+               !gs_par_load(&gs_par_quit)) {
+            gs_par_pause();
+            spun++;
+        }
+        if (spun < GS_PAR_SPIN) continue;
+        gs_mutex_lock(&gs_par_mutex);
+        gs_par_add(&gs_par_sleepers, 1);
+        while (gs_par_load(&gs_par_claim) >> 32 == seen && !gs_par_load(&gs_par_quit))
+            gs_cond_wait(&gs_par_wake, &gs_par_mutex);
+        gs_par_add(&gs_par_sleepers, -1);
+        gs_mutex_unlock(&gs_par_mutex);
+    }
+    gs_native_stack_free();
+    gs_par_add(&gs_par_live, -1);
+    #ifdef _WIN32
+        return 0;
+    #else
+        return NULL;
+    #endif
+}
+
+)GSRT"
+R"GSRT(/* The pool, made at the first fork: GOOSE_THREADS threads in all, or one for
+   each CPU the process may run on. */
+static void gs_par_start(void) {
+    const char *env = getenv("GOOSE_THREADS");
+    int64_t n = env && *env ? (int64_t)strtoll(env, NULL, 10) : gs_os_threads();
+    if (n < 1) n = 1;
+    if (n > 1024) n = 1024;
+    gs_par_threads = 1;
+    for (int64_t i = 1; i < n; i++) {
+        int failed;
+        gs_par_add(&gs_par_live, 1);
+        #ifdef _WIN32
+            HANDLE h = CreateThread(NULL, 0, gs_par_main, NULL, 0, NULL);
+            failed = h == NULL;
+            if (h) CloseHandle(h);
+        #else
+            pthread_t h;
+            pthread_attr_t attr;
+            failed = pthread_attr_init(&attr);
+            if (!failed) {
+                failed = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                if (!failed) failed = pthread_create(&h, &attr, gs_par_main, NULL);
+                pthread_attr_destroy(&attr);
+            }
+        #endif
+        if (failed) {
+            gs_par_add(&gs_par_live, -1);
+            break;  /* Fewer threads: the forks still run. */
+        }
+        gs_par_threads++;
+    }
+}
+
+)GSRT"
+R"GSRT(GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
+    if (hi <= lo) return;
+    if (hi - lo == 1 || gs_in_par || gs_contain || !gs_par_cas(&gs_par_busy, 0, 1)) {
+        f(env, lo, hi);
+        return;
+    }
+    if (!gs_par_threads) gs_par_start();
+    int64_t n = hi - lo, chunks = gs_par_threads == 1 ? 1 : gs_par_threads * GS_PAR_CHUNKS;
+    if (chunks > n) chunks = n;
+    if (chunks > 0xffff) chunks = 0xffff;
+    if (chunks == 1) {
+        gs_par_store(&gs_par_busy, 0);
+        f(env, lo, hi);
+        return;
+    }
+    gs_par_job.f = f;
+    gs_par_job.env = env;
+    gs_par_job.lo = lo;
+    gs_par_job.n = n;
+    gs_par_store(&gs_par_done, 0);
+    int64_t fork = ++gs_par_forks & 0x7fffffff;
+    if (!fork) fork = gs_par_forks = 1;  /* 0 is the pool threads' "none seen yet". */
+    gs_par_store(&gs_par_claim, fork << 32 | chunks << 16);
+    if (gs_par_load(&gs_par_sleepers)) {
+        gs_mutex_lock(&gs_par_mutex);
+        gs_cond_broadcast(&gs_par_wake);
+        gs_mutex_unlock(&gs_par_mutex);
+    }
+    gs_in_par = 1;
+    gs_par_chunks(fork);
+    gs_in_par = 0;
+    for (int spun = 0; gs_par_load(&gs_par_done) < chunks; spun++) {
+        if (spun < GS_PAR_SPIN) gs_par_pause();
+        else gs_par_yield();
+    }
+    gs_par_store(&gs_par_busy, 0);
+}
+
+)GSRT"
+R"GSRT(/* Ends the pool's threads (goose_exit). */
+static void gs_par_stop(void) {
+    if (!gs_par_threads) return;
+    gs_par_store(&gs_par_quit, 1);
+    gs_mutex_lock(&gs_par_mutex);
+    gs_cond_broadcast(&gs_par_wake);
+    gs_mutex_unlock(&gs_par_mutex);
+    while (gs_par_load(&gs_par_live)) gs_par_yield();
+    gs_par_store(&gs_par_quit, 0);
+    gs_par_threads = 0;
+}
+
+)GSRT"
 R"GSRT(#endif  /* GS_NEED_THREADS */
 
 )GSRT"
@@ -3842,6 +4068,7 @@ R"GSRT(/* The records of the thread programs that aborted go with the program
    (gs_rt_release). */
 GS_API void gs_rt_stop(void) {
 #if GS_NEED_THREADS
+    gs_par_stop();
     gs_mutex_lock(&gs_threads_mutex);
     if (gs_threads) {
         gs_mutex_unlock(&gs_threads_mutex);

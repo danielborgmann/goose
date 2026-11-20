@@ -1593,6 +1593,8 @@ struct CodeGen {
     string result;   // Includes, prototypes and code.
     string ExportHeader();
 
+    #include "par_for.h"
+
     // Extern-support C and user headers are inputs to this emission, not
     // process state that the driver must install before constructing us.
     // A function the extern support declares gets no prototype here.
@@ -1629,6 +1631,7 @@ struct CodeGen {
         EmitExports();
         if (!library) EmitMain();
         if (usesthreads) predefs = "#define GS_NEED_THREADS 1\n";
+        else if (usespar) predefs = "#define GS_PAR 1\n";
         // The instance block: with workers each thread reaches its own
         // through gs_gl; without them there is only main's.
         Append(data, "typedef struct {\n", gblock.empty() ? "    uint8_t gs_none;\n" : gblock,

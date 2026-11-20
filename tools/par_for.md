@@ -11,9 +11,9 @@ Code that uses `par for` needs our compiler. The README section of ours says so.
 ## Order (the note's §7, steps 1-3 then 5)
 
 1. `chunk(k, n)` and `chunk_at(bounds, k)` in `std`: done.
-2. The effect summary: per specialization, whether it (transitively) writes a global, calls a queue or
+2. The effect summary (done, as R3's pass): per specialization, whether it (transitively) writes a global, calls a queue or
    thread builtin, prints or writes stderr, exits, or calls an extern that is not `pure`.
-3. `par for`, option A: the keyword; R1 (captured places read-only), R2 structural (`for &x`, `chunk`,
+3. `par for`, option A (done): the keyword; R1 (captured places read-only), R2 structural (`for &x`, `chunk`,
    `chunk_at` with the loop index), R3 (no effects), R4 (no exits across the body), R5; stackless bodies
    only; outlining with an environment struct; the pool; `GOOSE_THREADS`; sequential under TinyCC.
 4. (`simd for`, the note's step 4: not asked for yet.)
@@ -50,9 +50,18 @@ par for v in E BODY        =>  the same with a `const if` on __s's type choosing
   `math` or `binary`, with only scalar or `const` view parameters).
 - **Names:** the nested function is `__par<file>_<n>`, by file and order, so a file parses to the same
   program each time (`goose format --verify` compares two parses).
+- **The fork** (`src/par_for.h`): the call's C arguments, but the range, go into an environment struct
+  (its fields are the callee's C parameters, `SigParams`), with the forking thread program's `gs_stks`,
+  `gs_nstks` and `gs_gl`; a thunk per call takes those and calls the function on a chunk;
+  `gs_par(thunk, &env, lo, hi)` runs it. The optimizer never inlines a par for's function.
+- **The pool** (`runtime_threads.h`, `gs_par_run`): made at the first fork, `GOOSE_THREADS` threads in
+  all or one per CPU. A fork is cut into 4 chunks per thread, claimed through one word holding the fork's
+  number, chunk count and next chunk; the forking thread runs chunks too, then waits for the rest. Pool
+  threads spin 4096 pauses for the next fork, then sleep on a condition variable. A program with a par
+  for and no threads gets `GS_PAR`, which turns on `GS_NEED_THREADS` except in a JIT run.
 - **Stackless only:** a body whose specialization needs `gs_sp` runs sequentially until step 5.
 - **Sequential fallbacks:** the JIT (`goose run`), `GOOSE_THREADS=1`, a fork inside a fork, a fork in a
-  contained worker.
+  contained worker, a fork while another thread program forks, a range of one iteration.
 
 ## Checks for each step
 
