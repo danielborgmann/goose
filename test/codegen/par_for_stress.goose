@@ -1,4 +1,4 @@
-// par for (tools/par_for.md) under load: many forks over a large array and many small ones, a fork inside a fork's body, and a body that needs a data stack, which runs as the plain loop.
+// par for (tools/par_for.md) under load: many forks over a large array and many small ones, a fork inside a fork's body, and a body that needs a data stack.
 import std;
 
 fn main() {
@@ -29,7 +29,7 @@ fn main() {
     s = 0;
     for v in out { s += v; }
     print(s);
-    // A growable local: the body needs a data stack, so it runs sequentially.
+    // A growable local: the body needs a data stack.
     par for i in 1000 {
         var t: i64[>..] = [];
         for j in i % 5 { t.push(j); }

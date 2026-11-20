@@ -504,6 +504,7 @@ static int64_t gs_par_threads;            /* The forking thread and the pool's; 
 static gs_mutex gs_par_mutex = GS_MUTEX_INIT;
 static gs_cond gs_par_wake = GS_COND_INIT;
 static GS_TLS int gs_in_par;              /* In a fork's body: a fork here runs sequentially. */
+static GS_TLS int gs_par_pooled;          /* A pool thread, which has a stack block of its own. */
 
 /* Runs chunks of fork `fork` until none is left to claim. */
 static void gs_par_chunks(int64_t fork) {
@@ -527,8 +528,12 @@ static void *gs_par_main(void *p)
 #endif
 {
     (void)p;
+    /* Room for the data stacks of the bodies that need them (gs_par_block),
+       which the compiler counts among a worker's. */
+    gs_regions_begin(gs_workerregions > 0 ? gs_workerregions : 1);
     gs_native_stack_init();
     gs_in_par = 1;
+    gs_par_pooled = 1;
     int64_t seen = 0;
     while (!gs_par_load(&gs_par_quit)) {
         int64_t fork = gs_par_load(&gs_par_claim) >> 32;
@@ -551,7 +556,7 @@ static void *gs_par_main(void *p)
         gs_par_add(&gs_par_sleepers, -1);
         gs_mutex_unlock(&gs_par_mutex);
     }
-    gs_native_stack_free();
+    gs_release_regions();
     gs_par_add(&gs_par_live, -1);
     #ifdef _WIN32
         return 0;
@@ -565,6 +570,7 @@ static void *gs_par_main(void *p)
 static void gs_par_start(void) {
     const char *env = getenv("GOOSE_THREADS");
     int64_t n = env && *env ? (int64_t)strtoll(env, NULL, 10) : gs_os_threads();
+    if (n > gs_thread_cap) n = gs_thread_cap;  /* What the data stack budget holds. */
     if (n < 1) n = 1;
     if (n > 1024) n = 1024;
     gs_par_threads = 1;
@@ -630,6 +636,9 @@ GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
     }
     gs_par_store(&gs_par_busy, 0);
 }
+
+/* Whether this is one of the pool's threads, rather than the forking one. */
+GS_API int gs_par_pool_thread(void) { return gs_par_pooled; }
 
 /* Ends the pool's threads (goose_exit). */
 static void gs_par_stop(void) {

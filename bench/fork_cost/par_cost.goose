@@ -1,7 +1,8 @@
 // The cost of a `par for` fork and join on the pool (FastGoose's
 // tools/par_for.md), next to spawn_cost.goose's share-nothing round: a fork
 // over a few elements per thread that do almost nothing, so what it measures
-// is the fork; then a loop with work in it, which shows what the pool gains.
+// is the fork; then loops with work in them, which show what the pool gains,
+// the last a tree walk per iteration with a growable local.
 // Run it again with GOOSE_THREADS=1 for the sequential times.
 //
 // Build and run (from this directory):
@@ -50,6 +51,32 @@ fn main() {
         format(note, " per loop");
         print(note);
     }
+    // A tree walk per iteration with a growable work list, which runs on each
+    // pool thread's own data stacks (children of i: 3i+1 .. 3i+3).
+    let nodes = 1 << 16;
+    var sums: i64[>..] = [];
+    for i in 4096 { sums.push(0); }
+    let reps = 5;
+    let t0 = clock();
+    for r in reps {
+        par for k in sums.len {
+            var todo: i64[>..] = [];
+            todo.push(k % 64);
+            var sum = 0;
+            while todo.len > 0 {
+                let i = todo.pop();
+                sum += out[i] % 7;
+                for c in 3 * i + 1..min(3 * i + 4, nodes) { todo.push(c); }
+            }
+            sums[k] = sum;
+        }
+    }
+    let t1 = clock();
+    var note: u8[>..] = [];
+    format(note, sums.len, " tree walks with a growable work list: ");
+    per(note, "", t1 - t0, reps);
+    format(note, " per loop");
+    print(note);
     var s = 0;
     for v in out { s ^= v; }
     print("checksum ", s, ", hardware_threads ", hardware_threads());

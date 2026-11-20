@@ -1073,6 +1073,7 @@ GS_API void gs_free_msg(uint8_t *msg);
    lo, hi) here (runtime_threads.h says when). */
 typedef void (*gs_par_fn)(void *env, int64_t lo, int64_t hi);
 GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi);
+GS_API int gs_par_pool_thread(void);
 
 )GSRT"
 R"GSRT(/* One queue per flat element type the program uses (the compiler emits a
@@ -1185,7 +1186,8 @@ R"GSRT(static int64_t gs_thread_spawn(void (*entry)(uint8_t *), const void *args
 #endif
 
 )GSRT"
-R"GSRT(/* A par for's fork, whose chunks the generated thunk runs after taking this
+R"GSRT(#ifdef GS_PAR
+/* A par for's fork, whose chunks the generated thunk runs after taking this
    thread program's stack block and globals instance. */
 static inline void gs_par(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
 #if GS_NEED_THREADS
@@ -1194,6 +1196,34 @@ static inline void gs_par(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
     f(env, lo, hi);
 #endif
 }
+
+)GSRT"
+R"GSRT(/* Whether a thunk runs on one of the pool's threads: a body that needs data
+   stacks runs there on the thread's own block (gs_par_block), and on the
+   forking thread on the stacks above the fork's. */
+static inline int gs_par_pooled_here(void) {
+#if GS_NEED_THREADS
+    return gs_par_pool_thread();
+#else
+    return 0;
+#endif
+}
+
+)GSRT"
+R"GSRT(/* A pool thread's block of n stacks, the most any par for body of the
+   program needs, made at its first such body and kept: the regions are
+   registered by their descriptors, which therefore stay where they are. */
+static GS_TLS gs_stack *gs_par_stks;
+static inline void gs_par_block(int64_t n) {
+    if (!gs_par_stks) {
+        gs_par_stks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));
+        if (!gs_par_stks) gs_panic("out of memory allocating stack block");
+        for (int64_t i = 0; i < n; i++) gs_stack_init(&gs_par_stks[i]);
+    }
+    gs_stks = gs_par_stks;
+    gs_nstks = n;
+}
+#endif
 
 )GSRT"
 R"GSRT(#endif  /* GS_RUNTIME_OBJECT */
@@ -3914,6 +3944,7 @@ static int64_t gs_par_threads;            /* The forking thread and the pool's; 
 static gs_mutex gs_par_mutex = GS_MUTEX_INIT;
 static gs_cond gs_par_wake = GS_COND_INIT;
 static GS_TLS int gs_in_par;              /* In a fork's body: a fork here runs sequentially. */
+static GS_TLS int gs_par_pooled;          /* A pool thread, which has a stack block of its own. */
 
 )GSRT"
 R"GSRT(/* Runs chunks of fork `fork` until none is left to claim. */
@@ -3939,8 +3970,12 @@ static void *gs_par_main(void *p)
 #endif
 {
     (void)p;
+    /* Room for the data stacks of the bodies that need them (gs_par_block),
+       which the compiler counts among a worker's. */
+    gs_regions_begin(gs_workerregions > 0 ? gs_workerregions : 1);
     gs_native_stack_init();
     gs_in_par = 1;
+    gs_par_pooled = 1;
     int64_t seen = 0;
     while (!gs_par_load(&gs_par_quit)) {
         int64_t fork = gs_par_load(&gs_par_claim) >> 32;
@@ -3963,7 +3998,7 @@ static void *gs_par_main(void *p)
         gs_par_add(&gs_par_sleepers, -1);
         gs_mutex_unlock(&gs_par_mutex);
     }
-    gs_native_stack_free();
+    gs_release_regions();
     gs_par_add(&gs_par_live, -1);
     #ifdef _WIN32
         return 0;
@@ -3978,6 +4013,7 @@ R"GSRT(/* The pool, made at the first fork: GOOSE_THREADS threads in all, or one
 static void gs_par_start(void) {
     const char *env = getenv("GOOSE_THREADS");
     int64_t n = env && *env ? (int64_t)strtoll(env, NULL, 10) : gs_os_threads();
+    if (n > gs_thread_cap) n = gs_thread_cap;  /* What the data stack budget holds. */
     if (n < 1) n = 1;
     if (n > 1024) n = 1024;
     gs_par_threads = 1;
@@ -4044,6 +4080,10 @@ R"GSRT(GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
     }
     gs_par_store(&gs_par_busy, 0);
 }
+
+)GSRT"
+R"GSRT(/* Whether this is one of the pool's threads, rather than the forking one. */
+GS_API int gs_par_pool_thread(void) { return gs_par_pooled; }
 
 )GSRT"
 R"GSRT(/* Ends the pool's threads (goose_exit). */

@@ -986,6 +986,7 @@ GS_API void gs_free_msg(uint8_t *msg);
    lo, hi) here (runtime_threads.h says when). */
 typedef void (*gs_par_fn)(void *env, int64_t lo, int64_t hi);
 GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi);
+GS_API int gs_par_pool_thread(void);
 
 /* One queue per flat element type the program uses (the compiler emits a
    gs_queue global per type, which main sets up before anything can use it).
@@ -1083,6 +1084,7 @@ static int64_t gs_thread_spawn(void (*entry)(uint8_t *), const void *args, int64
 }
 #endif
 
+#ifdef GS_PAR
 /* A par for's fork, whose chunks the generated thunk runs after taking this
    thread program's stack block and globals instance. */
 static inline void gs_par(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
@@ -1092,6 +1094,32 @@ static inline void gs_par(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
     f(env, lo, hi);
 #endif
 }
+
+/* Whether a thunk runs on one of the pool's threads: a body that needs data
+   stacks runs there on the thread's own block (gs_par_block), and on the
+   forking thread on the stacks above the fork's. */
+static inline int gs_par_pooled_here(void) {
+#if GS_NEED_THREADS
+    return gs_par_pool_thread();
+#else
+    return 0;
+#endif
+}
+
+/* A pool thread's block of n stacks, the most any par for body of the
+   program needs, made at its first such body and kept: the regions are
+   registered by their descriptors, which therefore stay where they are. */
+static GS_TLS gs_stack *gs_par_stks;
+static inline void gs_par_block(int64_t n) {
+    if (!gs_par_stks) {
+        gs_par_stks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));
+        if (!gs_par_stks) gs_panic("out of memory allocating stack block");
+        for (int64_t i = 0; i < n; i++) gs_stack_init(&gs_par_stks[i]);
+    }
+    gs_stks = gs_par_stks;
+    gs_nstks = n;
+}
+#endif
 
 #endif  /* GS_RUNTIME_OBJECT */
 

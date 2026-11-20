@@ -1631,7 +1631,7 @@ struct CodeGen {
         EmitExports();
         if (!library) EmitMain();
         if (usesthreads) predefs = "#define GS_NEED_THREADS 1\n";
-        else if (usespar) predefs = "#define GS_PAR 1\n";
+        if (usespar) predefs += "#define GS_PAR 1\n";
         // The instance block: with workers each thread reaches its own
         // through gs_gl; without them there is only main's.
         Append(data, "typedef struct {\n", gblock.empty() ? "    uint8_t gs_none;\n" : gblock,

@@ -84,9 +84,11 @@ par for k in parts {                                  // a contiguous run of out
   of the loop; `continue` ends one iteration.
 - The iterations run in chunks on a pool of threads (`GOOSE_THREADS`, by default one per CPU) that
   the first loop starts. A loop inside a loop's body, a loop in a contained worker, and every loop
-  under `GOOSE_THREADS=1` or `goose run` run as plain loops. So, for now, does a body that needs a
-  data stack (a growable local); bodies like that are the note's next step.
-- `bench/fork_cost/par_cost.goose` measures what a fork and join costs.
+  under `GOOSE_THREADS=1` or `goose run` run as plain loops.
+- A body may have growable locals, and call functions that do: on a pool thread it runs on that
+  thread's own data stacks, emptied after each chunk.
+- `bench/fork_cost/par_cost.goose` measures what a fork and join costs, and a tree walk per iteration
+  with a growable work list.
 
 ## Other additions
 

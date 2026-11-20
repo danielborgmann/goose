@@ -15,9 +15,9 @@ Code that uses `par for` needs our compiler. The README section of ours says so.
    thread builtin, prints or writes stderr, exits, or calls an extern that is not `pure`.
 3. `par for`, option A (done): the keyword; R1 (captured places read-only), R2 structural (`for &x`, `chunk`,
    `chunk_at` with the loop index), R3 (no effects), R4 (no exits across the body), R5; stackless bodies
-   only; outlining with an environment struct; the pool; `GOOSE_THREADS`; sequential under TinyCC.
+   first; outlining with an environment struct; the pool; `GOOSE_THREADS`; sequential under TinyCC.
 4. (`simd for`, the note's step 4: not asked for yet.)
-5. Child programs: bodies with growable locals, a stack block per pool thread, rewound per task.
+5. Child programs (done): bodies with growable locals, a stack block per pool thread, rewound per task.
 
 ## How step 3 is built
 
@@ -59,7 +59,11 @@ par for v in E BODY        =>  the same with a `const if` on __s's type choosing
   number, chunk count and next chunk; the forking thread runs chunks too, then waits for the rest. Pool
   threads spin 4096 pauses for the next fork, then sleep on a condition variable. A program with a par
   for and no threads gets `GS_PAR`, which turns on `GS_NEED_THREADS` except in a JIT run.
-- **Stackless only:** a body whose specialization needs `gs_sp` runs sequentially until step 5.
+- **Bodies that need data stacks** (`gs_sp`): the thunk is written once the stack counts are known
+  (`EmitParThunks`). On the forking thread it calls the function at the fork's `gs_sp`; on a pool thread
+  (`gs_par_pool_thread`) on the thread's own block (`gs_par_block`), as many stacks as the program's
+  neediest par for body, made at the thread's first such chunk and kept, every top put back after each
+  chunk. The block counts among a worker's regions, which caps the pool by the data stack budget.
 - **Sequential fallbacks:** the JIT (`goose run`), `GOOSE_THREADS=1`, a fork inside a fork, a fork in a
   contained worker, a fork while another thread program forks, a range of one iteration.
 
