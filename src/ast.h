@@ -1511,6 +1511,18 @@ NODE_END
 // Symbols (top-level declarations). Wrapped in decl nodes so a module's
 // top-level items keep source order for dumping.
 
+// What the parser knows of a `par for` it rewrote into a nested function
+// and a call to it (par_for.h, tools/par_for.md), for the checker's rules.
+struct ParInfo {
+    Line line;                          // Of the `par for`.
+    vector<string_view> names;          // The body may not declare these: the loop's, the
+                                        // owned arrays', and the chunk counts and bounds.
+    vector<string_view> owned;          // The enclosing arrays passed in as the iteration's own.
+    string_view idx;                    // The index those are reached by.
+    vector<const Node *> gen;           // The declarations the rewrite made of those names.
+    vector<pair<const Node *, string>> errors;  // Found by the parser, reported by the checker.
+};
+
 struct SFunction {
     string_view name;           // The leaf name, as lexical lookups and diagnostics use it.
     string_view ns;             // Its namespace, "" for the global one (docs/design/namespaces.md).
@@ -1557,6 +1569,8 @@ struct SFunction {
     // against (TypeCheck::ResolveCall).
     bool brokensig = false;
     vector<FnSpec *> specs;     // Specializations (typecheck), owned by Ast.
+    // The nested function a `par for` became (par_for.h); its calls fork.
+    struct ParInfo *par = nullptr;
 
     // Checked once per distinct argument types (§7.7): a function with type
     // parameters or an untyped parameter.

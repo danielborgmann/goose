@@ -45,6 +45,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
         // to its binding alone (`let`, a copy: WholeWritable, §4.4).
         lv.writable = !vd->copybind && !(vd->type && vd->type->cq);
         lv.letbound = !vd->isvar;
+        if (ParCaptured(vd)) lv.writable = false, lv.letbound = true;  // par for R1
         lv.letname = vd->name;
         lv.copyof = vd->copybind ? vd : nullptr;
         lv.reusable = vd->reusable;

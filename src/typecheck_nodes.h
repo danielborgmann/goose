@@ -92,6 +92,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
         v.type = tc.LoadType(t);
         if (IsRefOrSlice(t)) {
             v.SetProv(tc.RefProvOf(vd));
+            if (tc.ParCaptured(vd)) v.writable = false;  // par for R1
             v.lvalue = t->kind == TY_SLICE;   // A slice variable is storage; a reference is the pointee's path.
             if (v.lvalue) {
                 v.slot.Set(vd, true);
@@ -107,7 +108,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
         } else {
             v.Set(vd, true);
             v.byteview = vd->contentbyteview;
-            v.writable = !vd->copybind && !(vd->type && vd->type->cq);
+            v.writable = !vd->copybind && !(vd->type && vd->type->cq) && !tc.ParCaptured(vd);
             v.reusable = vd->reusable;
             v.nonneg = vd->nonneg;
             if (vd->nonneg) v.nonnegfrom = vd;

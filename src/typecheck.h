@@ -780,7 +780,7 @@ struct TypeCheck {
     }
 
     [[noreturn]] void Error(const Node *n, const string &msg) {
-        ErrorIn(LocOf(n), msg,
+        ErrorIn(LocOf(n), ParExplain(n, msg),
                 Chain(n->expansiontrace.empty() ? ActiveExpansionTrace() : n->expansiontrace));
     }
 
@@ -3172,6 +3172,8 @@ struct TypeCheck {
     // error ends the root it is in, and costs the program the diagnostics of
     // the code that root reached after it; the rest is checked as if the
     // root had completed.
+    #include "par_for_check.h"
+
     void CheckRoots() {
         for (auto g : ast.globals) {
             if (CheckRoot([&] { CheckVarDecl(g, true); })) {
@@ -3242,6 +3244,7 @@ struct TypeCheck {
         CheckRoot([&] { VerifyLiterals(); });
         CheckRoot([&] { ReportRedundantCasts(); });
         CheckRoot([&] { CheckDefers(); });
+        CheckParBodies();
         if (ast.exemplars) CheckExemplars();
     }
 

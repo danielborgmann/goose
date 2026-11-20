@@ -297,6 +297,8 @@ struct Parser {
         return true;
     }
 
+    #include "par_for_parse.h"
+
     // `inline` is a keyword only before a function declaration (§7.13): it
     // stays a name everywhere else.
     bool AtInline() {
@@ -2066,6 +2068,10 @@ struct Parser {
     // ended (its `}` consumed, by a guard's rest of the block included).
     bool ParseStatement(Block *b) {
         if (AtInline() || AtCheckfree()) goto nestedfndecl;
+        if (AtPar()) {
+            b->stmts.push_back(ParsePar());
+            return true;
+        }
         switch (lex.tok) {
             case T_LET: case T_VAR: case T_CONST: case T_REUSABLE: {
                 if (lex.tok == T_CONST && lex.PeekTok() == T_FOR) {
