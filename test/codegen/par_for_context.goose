@@ -1,4 +1,5 @@
 import std;
+import os;
 // A context struct for the iterations: shared tables through const fields, the body's own
 // locals through writable ones, which a function the body (and main) calls writes through.
 struct Sc { bail: bool = false, n: i64 = 0 }
@@ -36,6 +37,11 @@ fn main() {
     cmp.resize(3, 0);
     par for i in 0..3 { cmp[i] = compare(g_word, ["abc", "mid", "zed"][i]); }
     print(cmp);
+    // The monotonic clock, to time an iteration: never runs backwards within one.
+    var ticks: bool[>..] = [];
+    ticks.resize(8, false);
+    par for i in 0..8 { let t0 = clock_ns(); out[i] = i * i; ticks[i] = clock_ns() >= t0 && clock() > 0.0; }
+    print(ticks);
     var lsc = Sc {};
     var lb: i64[>..] = [];
     var px = P { tab: g_tab, sc: lsc, buf: lb };

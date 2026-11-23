@@ -150,11 +150,14 @@ static bool ParWritableView(const TypeExpr *t) {
 
 // An extern a body may call (R3): the standard library's computations on
 // values, which are math's, binary's and std's taking nothing they could
-// write through. A `pure` marker is for later (llm_frontier §3.4).
+// write through, and os's monotonic clock, which reads a counter each thread
+// may (a reading is not ordered by iteration, as a plain for's would be).
+// A `pure` marker is for later (llm_frontier §3.4).
 bool ParPureExtern(const FnSpec *sp) {
     auto fi = sp->sf->line.fileidx;
     if (!ast.StdlibFile(fi)) return false;
     auto stem = PathStem(ast.sources[fi].first);
+    if (stem == "os" && sp->sf->name == "clock_ns") return true;
     if (stem != "std" && stem != "math" && stem != "binary") return false;
     // A writable parameter is an out-parameter of numbers, which the call
     // must pass storage the iteration may write, as any call must (§9.5).

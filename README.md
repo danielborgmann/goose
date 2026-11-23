@@ -108,7 +108,9 @@ its writes for main, and only the body's version refuses them.
 **What a body may not do**, also inside any function it calls: print, exit, spawn or wait for threads,
 use queues, write a global, or call an extern outside the standard library's pure ones (`std`, `math`,
 `binary`, whose parameters are scalars, `const` views, or numbers it writes back: `i32&`, `f64[:]`).
-A body cannot `return` or `break` out of the loop; `continue` ends one iteration.
+`os`'s monotonic clock is allowed too (`clock_ns()`, `clock()`), to time an iteration; its readings
+are not ordered by iteration the way a plain `for`'s are. A body cannot `return` or `break` out of
+the loop; `continue` ends one iteration.
 
 **Every refusal at once.** A check stops a loop at its first refusal. When porting much code to
 `par for`, set `GOOSE_PAR_ALL=1` and one check lists them all: every direct write to a variable of
