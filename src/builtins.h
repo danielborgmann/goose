@@ -78,6 +78,7 @@ inline int RecvKindOf(TypeExpr *t) {
     F(B_HARDWARE_THREADS, "hardware_threads", 0,  0,   "",   "i", 0,              "",            0) \
     F(B_PAR_THREADS,      "par_threads",      1,  1,   "i",  "i", 0,              "",            0) \
     F(B_PAR_SPIN_US,      "par_spin_us",      1,  1,   "i",  "i", 0,              "",            0) \
+    F(B_PAR_WARM,         "par_warm",         0,  0,   "",   "i", 0,              "",            0) \
     F(B_THREAD_SPAWN,     "thread_spawn",     1, 99,   "",   "i", 0,              "",            0) \
     F(B_THREAD_SPAWN_CONTAINED, "thread_spawn_contained", 1, 99, "", "i", 0,       "",            0) \
     F(B_THREAD_WAIT,      "thread_wait",      1,  2,   "",   "",  0,              "append to",   BF_OUTARG) \

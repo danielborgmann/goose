@@ -134,6 +134,12 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
         case B_HARDWARE_THREADS: return { "gs_hardware_threads()" };
         // Emitted here, not returned as text: a discarded result would drop
         // the setting.
+        case B_PAR_WARM: {
+            usesthreads = true;
+            auto t = T();
+            L("int64_t ", t, " = gs_par_warm();");
+            return { t };
+        }
         case B_PAR_THREADS: case B_PAR_SPIN_US: {
             usesthreads = true;
             auto t = T();

@@ -1200,6 +1200,16 @@ GS_API int gs_par_pool_thread(void);
    what it now is. */
 GS_API int64_t gs_par_set_threads(int64_t n);
 GS_API int64_t gs_par_set_spin(int64_t us);
+/* What each pool thread runs as it starts, before it takes part in a fork:
+   the generated program's, making the thread's block of stacks
+   (gs_par_block). */
+GS_API void gs_par_set_start(void (*start)(void));
+/* The calling pool thread's block of stacks (gs_par_block): sets it to
+   block unless that is NULL, and returns it. */
+GS_API void *gs_par_stack_block(void *block);
+/* par_warm(): starts the pool now, its threads making their stacks in the
+   background, so that the first fork does not; returns its size. */
+GS_API int64_t gs_par_warm(void);
 
 )GSRT"
 R"GSRT(/* One queue per flat element type the program uses (the compiler emits a
@@ -1337,17 +1347,40 @@ static inline int gs_par_pooled_here(void) {
 
 )GSRT"
 R"GSRT(/* A pool thread's block of n stacks, the most any par for body of the
-   program needs, made at its first such body and kept: the regions are
-   registered by their descriptors, which therefore stay where they are. */
-static GS_TLS gs_stack *gs_par_stks;
+   program needs, made as the thread starts (gs_par_ready) and kept: the
+   regions are registered by their descriptors, which therefore stay where
+   they are. The runtime holds it (gs_par_stack_block), not a static here:
+   under --split every unit has its own statics. */
 static inline void gs_par_block(int64_t n) {
-    if (!gs_par_stks) {
-        gs_par_stks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));
-        if (!gs_par_stks) gs_panic("out of memory allocating stack block");
-        for (int64_t i = 0; i < n; i++) gs_stack_init(&gs_par_stks[i]);
+#if GS_NEED_THREADS
+    gs_stack *b = (gs_stack *)gs_par_stack_block(NULL);
+    if (!b) {
+        b = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));
+        if (!b) gs_panic("out of memory allocating stack block");
+        /* Each stack's first page touched too, which commits it (Windows):
+           at the thread's start, not in its first chunk. */
+        for (int64_t i = 0; i < n; i++) {
+            gs_stack_init(&b[i]);
+            *(volatile uint8_t *)b[i].top = 0;
+        }
+        gs_par_stack_block(b);
     }
-    gs_stks = gs_par_stks;
+    gs_stks = b;
     gs_nstks = n;
+#else
+    (void)n;
+#endif
+}
+
+)GSRT"
+R"GSRT(/* Has each pool thread make its block as it starts, so that the first fork
+   does not wait for it in a chunk. */
+static inline void gs_par_ready(void (*start)(void)) {
+#if GS_NEED_THREADS
+    gs_par_set_start(start);
+#else
+    (void)start;
+#endif
 }
 #endif
 
@@ -4086,7 +4119,18 @@ R"GSRT(/* ----------------------------------------------------------------------
 
 )GSRT"
 R"GSRT(#ifdef _WIN32
-#define gs_par_load(p)          InterlockedCompareExchange64((p), 0, 0)
+/* A load is a plain one (x86-64's are ordered), so spinning threads share the
+   word's cache line rather than taking it in turns. */
+#if defined(__clang__)
+#define gs_par_load(p)          __atomic_load_n((p), __ATOMIC_SEQ_CST)
+#else
+#include <intrin.h>
+static __forceinline int64_t gs_par_load(volatile int64_t *p) {
+    int64_t v = __iso_volatile_load64((const volatile __int64 *)p);
+    _ReadWriteBarrier();
+    return v;
+}
+#endif
 #define gs_par_store(p, v)      InterlockedExchange64((p), (v))
 #define gs_par_cas(p, old, nw)  (InterlockedCompareExchange64((p), (nw), (old)) == (old))
 #define gs_par_add(p, v)        InterlockedExchangeAdd64((p), (v))
@@ -4135,10 +4179,14 @@ static volatile int64_t gs_par_want;      /* par_threads: the size asked for, 0 
 static volatile int64_t gs_par_spin_ns = -1;  /* par_spin_us, in ns; -1 not set. */
 #ifdef _WIN32
 static uint64_t gs_par_pmask;             /* Pool threads' affinity on a hybrid CPU, 0 for none. */
+static uint64_t gs_par_cores[64];         /* The performance cores' CPUs, one mask per core. */
+static int gs_par_ncores;
+static int gs_par_percore;                /* Each pool thread held to a core of its own. */
 #endif
 static gs_mutex gs_par_mutex = GS_MUTEX_INIT;
 static gs_cond gs_par_wake = GS_COND_INIT;
 static GS_TLS int gs_in_par;              /* In a fork's body: a fork here runs sequentially. */
+static void (*gs_par_startfn)(void);   /* gs_par_set_start's, run by each pool thread. */
 static GS_TLS int gs_par_pooled;          /* A pool thread, which has a stack block of its own. */
 
 )GSRT"
@@ -4162,6 +4210,58 @@ static int64_t gs_par_now_ns(void) {
 }
 
 )GSRT"
+R"GSRT(/* UMONITOR/UMWAIT (WAITPKG, Intel since Alder Lake and Tremont): a wait in
+   the C0.2 state until the claim word's line is written or about 20 us of
+   TSC ticks pass. Encoded as bytes, which every compiler here takes without
+   a target flag; TinyCC never forks (gs_par_run). */
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(__TINYC__)
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#include <immintrin.h>
+#endif
+static int gs_par_has_umwait(void) {
+    static int has = -1;
+    if (has < 0) {
+        uint32_t r[4] = { 0, 0, 0, 0 };
+        #if defined(_MSC_VER) && !defined(__clang__)
+            int q[4];
+            __cpuidex(q, 0, 0);
+            if (q[0] >= 7) {
+                __cpuidex(q, 7, 0);
+                r[2] = (uint32_t)q[2];
+            }
+        #else
+            uint32_t max;
+            __asm__ volatile("cpuid" : "=a"(max), "=b"(r[1]), "=c"(r[0]), "=d"(r[3]) : "a"(0), "c"(0));
+            r[2] = 0;
+            if (max >= 7)
+                __asm__ volatile("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(7), "c"(0));
+        #endif
+        has = (r[2] >> 5) & 1;
+    }
+    return has;
+}
+static void gs_par_umwait(volatile int64_t *p, int64_t seen) {
+    #if defined(_MSC_VER) && !defined(__clang__)
+        _umonitor((void *)p);
+        if (gs_par_load(p) >> 32 == seen) _umwait(0, __rdtsc() + 50000);
+    #else
+        __asm__ volatile(".byte 0xf3, 0x0f, 0xae, 0xf0" : : "a"(p) : "memory");  /* umonitor rax */
+        if (gs_par_load(p) >> 32 == seen) {
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            uint64_t t = ((uint64_t)hi << 32 | lo) + 50000;
+            __asm__ volatile(".byte 0xf2, 0x0f, 0xae, 0xf1"  /* umwait ecx */
+                             : : "c"(0), "a"((uint32_t)t), "d"((uint32_t)(t >> 32)) : "memory", "cc");
+        }
+    #endif
+}
+#else
+static int gs_par_has_umwait(void) { return 0; }
+static void gs_par_umwait(volatile int64_t *p, int64_t seen) { (void)p; (void)seen; }
+#endif
+
+)GSRT"
 R"GSRT(/* How long a pool thread spins before it sleeps: par_spin_us, else
    GOOSE_PAR_SPIN_US, else GS_PAR_SPIN_US. */
 static int64_t gs_par_spin(void) {
@@ -4177,12 +4277,10 @@ static int64_t gs_par_spin(void) {
 
 )GSRT"
 R"GSRT(/* The pool's size by default: GOOSE_THREADS in all, else one thread for each
-   CPU the process may run on, but on a hybrid CPU one for each of the
-   performance cores' CPUs, which the pool's threads are then held to: a
-   fork waits for its slowest chunk, which is one on an efficiency core (on
-   a 13900HX against all 32 CPUs: a fork and join twice as fast, a long loop
-   of pure arithmetic 1.9 times slower). Windows only for now: elsewhere one
-   per CPU. */
+   CPU the process may run on, but under Windows one for each physical core
+   of the fastest kind, which the pool's threads are then held to, one core
+   each: a fork waits for its slowest chunk, which is one on an efficiency
+   core or on a core whose other thread is busy too. Elsewhere one per CPU. */
 static int64_t gs_par_default(void) {
     const char *env = getenv("GOOSE_THREADS");
     if (env && *env) return (int64_t)strtoll(env, NULL, 10);
@@ -4202,7 +4300,7 @@ static int64_t gs_par_default(void) {
     char *buf = len ? (char *)malloc(len) : NULL;
     if (!buf) return n;
     if (info(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len)) {
-        int lo = 255, hi = -1;
+        int lo = 255, hi = -1, smt = 0;
         for (DWORD off = 0; off < len;) {
             SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *p =
                 (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + off);
@@ -4210,23 +4308,26 @@ static int64_t gs_par_default(void) {
                 int c = p->Processor.EfficiencyClass;
                 if (c < lo) lo = c;
                 if (c > hi) hi = c;
+                if (p->Processor.Flags & LTP_PC_SMT) smt = 1;
             }
             off += p->Size;
         }
-        if (hi > lo) {
+        if (hi > lo || smt) {
             uint64_t mask = 0;
+            gs_par_ncores = 0;
             for (DWORD off = 0; off < len;) {
                 SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *p =
                     (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + off);
                 uint64_t m = (uint64_t)(p->Processor.GroupMask[0].Mask & proc);
                 if (p->Processor.GroupMask[0].Group == 0 && m &&
-                    p->Processor.EfficiencyClass == hi)
+                    p->Processor.EfficiencyClass == hi) {
                     mask |= m;
+                    if (gs_par_ncores < 64) gs_par_cores[gs_par_ncores++] = m;
+                }
                 off += p->Size;
             }
             if (mask) {
-                n = 0;
-                for (uint64_t m = mask; m; m &= m - 1) n++;
+                n = gs_par_ncores;
                 gs_par_pmask = mask;
             }
         }
@@ -4247,7 +4348,9 @@ static int64_t gs_par_size(void) {
     int64_t d = gs_par_default();
     if (n <= 0) n = d;
     #ifdef _WIN32
-        /* Held to the performance cores only while it fits on them. */
+        /* Held to the fastest cores only while it fits on them: one core
+           each while there are as many, else their CPUs. */
+        gs_par_percore = gs_par_pmask && n <= gs_par_ncores;
         if (gs_par_pmask) {
             int64_t logical = 0;
             for (uint64_t m = gs_par_pmask; m; m &= m - 1) logical++;
@@ -4296,6 +4399,10 @@ static void *gs_par_main(void *p)
         /* The performance cores' mask on a hybrid CPU (gs_par_start). */
         if (p) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)(uintptr_t)p);
     #endif
+    /* The block of stacks before the first chunk: a chunk that made it would
+       keep the forking thread waiting for that (reserving and registering a
+       region per stack, which threads take a process-wide lock for). */
+    if (gs_par_startfn) gs_par_startfn();
     int64_t seen = 0;
     while (!gs_par_load(&gs_par_quit)) {
         int64_t fork = gs_par_load(&gs_par_claim) >> 32;
@@ -4304,11 +4411,15 @@ static void *gs_par_main(void *p)
             gs_par_chunks(fork);
             continue;
         }
-        /* Spin for gs_par_spin(), reading the clock every 64 pauses (a pause
-           is 30 to 140 cycles, by the core). */
+        /* Wait for gs_par_spin(), reading the clock every 64 rounds: in
+           UMWAIT where the CPU has it, a light sleep that a write to the
+           claim word ends and that leaves the core to its other thread, else
+           a pause (30 to 140 cycles, by the core). */
         int64_t until = gs_par_now_ns() + gs_par_spin(), forked = 0;
+        int umwait = gs_par_has_umwait();
         for (int spun = 1; !forked; spun++) {
-            gs_par_pause();
+            if (umwait) gs_par_umwait(&gs_par_claim, seen);
+            else gs_par_pause();
             forked = gs_par_load(&gs_par_claim) >> 32 != seen || gs_par_load(&gs_par_quit);
             if (!(spun & 63) && gs_par_now_ns() >= until) break;
         }
@@ -4339,7 +4450,9 @@ static void gs_par_start(int64_t n) {
         int failed;
         gs_par_add(&gs_par_live, 1);
         #ifdef _WIN32
-            HANDLE h = CreateThread(NULL, 0, gs_par_main, (LPVOID)(uintptr_t)gs_par_pmask, 0, NULL);
+            uint64_t m = gs_par_percore ? gs_par_cores[(gs_par_ncores - n + i) % gs_par_ncores]
+                                        : gs_par_pmask;
+            HANDLE h = CreateThread(NULL, 0, gs_par_main, (LPVOID)(uintptr_t)m, 0, NULL);
             failed = h == NULL;
             if (h) CloseHandle(h);
         #else
@@ -4410,6 +4523,17 @@ R"GSRT(GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
 }
 
 )GSRT"
+R"GSRT(/* Set on main as the program starts, before any pool thread exists. */
+GS_API void gs_par_set_start(void (*start)(void)) { gs_par_startfn = start; }
+
+)GSRT"
+R"GSRT(static GS_TLS void *gs_par_stks;
+GS_API void *gs_par_stack_block(void *block) {
+    if (block) gs_par_stks = block;
+    return gs_par_stks;
+}
+
+)GSRT"
 R"GSRT(/* Whether this is one of the pool's threads, rather than the forking one. */
 GS_API int gs_par_pool_thread(void) { return gs_par_pooled; }
 
@@ -4423,6 +4547,25 @@ GS_API int64_t gs_par_set_threads(int64_t n) {
     int64_t got = gs_par_size();
     gs_par_store(&gs_par_busy, 0);
     return got;
+}
+
+)GSRT"
+R"GSRT(/* par_warm(): the pool of the size the next fork would have, started now if
+   it is not running at that size; its threads make their blocks of stacks as
+   they start, while this thread goes on. A contained worker's forks run
+   sequentially, so it starts nothing there. */
+GS_API int64_t gs_par_warm(void) {
+    if (gs_in_par || gs_contain) return 1;
+    while (!gs_par_cas(&gs_par_busy, 0, 1)) gs_par_yield();
+    if (!gs_par_threads || gs_par_load(&gs_par_want) != gs_par_wanted) {
+        gs_par_wanted = gs_par_load(&gs_par_want);
+        int64_t n = gs_par_size();
+        if (gs_par_threads && n != gs_par_asked) gs_par_stop();
+        if (!gs_par_threads) gs_par_start(n);
+    }
+    int64_t n = gs_par_threads;
+    gs_par_store(&gs_par_busy, 0);
+    return n;
 }
 
 )GSRT"

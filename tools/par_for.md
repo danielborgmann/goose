@@ -48,6 +48,10 @@ par for v in E BODY        =>  the same with a `const if` on __s's type choosing
   (`ParCaptured`, applied where the checker decides writability); a refused write says why and what the
   body may write instead (`ParExplain`, a hook in `TypeCheck::Error`). The body may not redeclare the
   loop's names, an owned `X`, N or B (`ParDeclare`).
+- **The pool's start.** Each pool thread makes its block of stacks (the most any body needs) as it
+  starts, before it claims a chunk, so the first fork waits only for the threads that are ready; the
+  program's init names that block's maker (`gs_par_ready`). `par_warm()` starts the pool without a
+  fork.
 - **R4:** `return` and a `break` of the marked loop are checker errors; `continue` ends the iteration.
 - **R3:** a pass after checking, over the nested function's specialization and everything it calls:
   print, exit, threads and queues, a write to a global, an extern that is not pure (pure: from `std`,
@@ -71,18 +75,20 @@ par for v in E BODY        =>  the same with a `const if` on __s's type choosing
   `gs_nstks` and `gs_gl`; a thunk per call takes those and calls the function on a chunk;
   `gs_par(thunk, &env, lo, hi)` runs it. The optimizer never inlines a par for's function.
 - **The pool** (`runtime_threads.h`, `gs_par_run`): made at the first fork, `GOOSE_THREADS` threads in
-  all or one per CPU, or on a hybrid CPU under Windows one per CPU of the performance cores (the
-  highest `EfficiencyClass`), with the pool's threads held to them. `par_threads(n)` asks for another
+  all or one per CPU, or under Windows on a hybrid or SMT CPU one per physical core of the highest
+  `EfficiencyClass`, each pool thread held to a core of its own (`gs_par_percore`). `par_threads(n)` asks for another
   size; the next fork stops the pool and starts one of that size. A fork is cut into 4 chunks per
   thread, claimed through one word holding the fork's number, chunk count and next chunk; the forking
-  thread runs chunks too, then waits for the rest. Pool threads spin for the next fork, 200 us or
+  thread runs chunks too, then waits for the rest. The pool's threads read that word with plain loads,
+so waiting ones share its cache line. They wait for the next fork in UMWAIT where the CPU has it
+(`gs_par_umwait`, which a write to the word ends), else in `pause`, for 200 us or
   `par_spin_us`/`GOOSE_PAR_SPIN_US` (a 13900HX's 4096 pauses, the old spin: 170 us on a P core, 75 on
   an E core), then sleep on a condition variable. A program with a par
   for and no threads gets `GS_PAR`, which turns on `GS_NEED_THREADS` except in a JIT run.
 - **Bodies that need data stacks** (`gs_sp`): the thunk is written once the stack counts are known
   (`EmitParThunks`). On the forking thread it calls the function at the fork's `gs_sp`; on a pool thread
   (`gs_par_pool_thread`) on the thread's own block (`gs_par_block`), as many stacks as the program's
-  neediest par for body, made at the thread's first such chunk and kept, every top put back after each
+  neediest par for body, made as the thread starts and kept, every top put back after each
   chunk. The block counts among a worker's regions, which caps the pool by the data stack budget.
 - **Sequential fallbacks:** the JIT (`goose run`), `GOOSE_THREADS=1`, a fork inside a fork, a fork in a
   contained worker, a fork while another thread program forks, a range of one iteration.

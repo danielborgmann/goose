@@ -102,6 +102,8 @@ void EmitParThunks(int64_t &workerregions) {
     for (auto &t : parthunks) n = std::max(n, stackneed[t.sp]);
     CheckStackLimit("a par for body", n, parthunks[0].sp->sf->line);
     workerregions = std::max(workerregions, n);
+    // What a pool thread runs as it starts (gs_par_ready).
+    Append(code, "static void gs_par_poolstart(void) { gs_par_block(", n, "); }\n\n");
     for (auto &t : parthunks) {
         Append(code, "static void ", t.name, "(void *gs_ev, int64_t gs_lo, int64_t gs_hi) {\n",
                "    ", t.env, " *e = (", t.env, " *)gs_ev;\n",

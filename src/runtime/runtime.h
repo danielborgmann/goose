@@ -1109,6 +1109,16 @@ GS_API int gs_par_pool_thread(void);
    what it now is. */
 GS_API int64_t gs_par_set_threads(int64_t n);
 GS_API int64_t gs_par_set_spin(int64_t us);
+/* What each pool thread runs as it starts, before it takes part in a fork:
+   the generated program's, making the thread's block of stacks
+   (gs_par_block). */
+GS_API void gs_par_set_start(void (*start)(void));
+/* The calling pool thread's block of stacks (gs_par_block): sets it to
+   block unless that is NULL, and returns it. */
+GS_API void *gs_par_stack_block(void *block);
+/* par_warm(): starts the pool now, its threads making their stacks in the
+   background, so that the first fork does not; returns its size. */
+GS_API int64_t gs_par_warm(void);
 
 /* One queue per flat element type the program uses (the compiler emits a
    gs_queue global per type, which main sets up before anything can use it).
@@ -1229,17 +1239,39 @@ static inline int gs_par_pooled_here(void) {
 }
 
 /* A pool thread's block of n stacks, the most any par for body of the
-   program needs, made at its first such body and kept: the regions are
-   registered by their descriptors, which therefore stay where they are. */
-static GS_TLS gs_stack *gs_par_stks;
+   program needs, made as the thread starts (gs_par_ready) and kept: the
+   regions are registered by their descriptors, which therefore stay where
+   they are. The runtime holds it (gs_par_stack_block), not a static here:
+   under --split every unit has its own statics. */
 static inline void gs_par_block(int64_t n) {
-    if (!gs_par_stks) {
-        gs_par_stks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));
-        if (!gs_par_stks) gs_panic("out of memory allocating stack block");
-        for (int64_t i = 0; i < n; i++) gs_stack_init(&gs_par_stks[i]);
+#if GS_NEED_THREADS
+    gs_stack *b = (gs_stack *)gs_par_stack_block(NULL);
+    if (!b) {
+        b = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));
+        if (!b) gs_panic("out of memory allocating stack block");
+        /* Each stack's first page touched too, which commits it (Windows):
+           at the thread's start, not in its first chunk. */
+        for (int64_t i = 0; i < n; i++) {
+            gs_stack_init(&b[i]);
+            *(volatile uint8_t *)b[i].top = 0;
+        }
+        gs_par_stack_block(b);
     }
-    gs_stks = gs_par_stks;
+    gs_stks = b;
     gs_nstks = n;
+#else
+    (void)n;
+#endif
+}
+
+/* Has each pool thread make its block as it starts, so that the first fork
+   does not wait for it in a chunk. */
+static inline void gs_par_ready(void (*start)(void)) {
+#if GS_NEED_THREADS
+    gs_par_set_start(start);
+#else
+    (void)start;
+#endif
 }
 #endif
 

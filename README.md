@@ -147,18 +147,24 @@ elements another iteration is writing.
 **How it runs.**
 
 - The first `par for` starts a pool of threads, within the program's thread cap, the thread that forks
-  among them: `GOOSE_THREADS` in all if that is set, else one per CPU. On a hybrid CPU under Windows
-  the default is one per CPU of the performance cores instead, and the pool's threads are kept to
-  them: a fork waits for its slowest chunk, and on an efficiency core every chunk is slow. On a
-  13900HX (16 such CPUs of 32), against all 32: a fork and join is twice as fast, and so is a loop of
-  a few thousand short iterations, while a loop of a million long ones is 1.9 times slower.
+  among them: `GOOSE_THREADS` in all if that is set, else one per CPU. Under Windows, on a hybrid CPU
+  or one whose cores run two threads each, the default is one thread per physical core of the fastest
+  kind instead, each kept to a core of its own: a fork waits for its slowest chunk, which is the one
+  on an efficiency core, or on a core whose other thread is busy too. A 13900HX (8 performance cores of
+  24, 32 CPUs) gets 8.
 - `par_threads(n)` sets the pool's size from the next fork on (0: the default again) and returns the
-  size it will be; a size beyond the performance cores' is not held to them. `hardware_threads()` is
+  size it will be; a size beyond those cores' threads is not held to them. `hardware_threads()` is
   every CPU. Time a few sizes on the loops that matter: past a point, more threads make a loop
   slower.
+- The pool starts at the first fork, and each of its threads first makes its data stacks, the most
+  any `par for` body needs. A program whose first fork must be quick (a page's first layout, say) can
+  start it sooner with `par_warm()`, which returns at once and leaves the threads to start in the
+  background; it returns the pool's size.
 - A loop is cut into 4 chunks per thread, which the threads claim one at a time, so uneven iterations
   even out. The loop ends when every chunk is done.
-- Between loops the pool threads spin for 200 microseconds, then sleep on a condition variable: a
+- Between loops the pool threads wait for 200 microseconds, then sleep on a condition variable. They
+  wait in `umwait` where the CPU has it (Intel since Alder Lake), which leaves the core to its other
+  thread and wakes on the next fork, else in a spin of `pause` instructions: a
   program that forks in a tight loop does not pay a wake-up each time, and an idle one does not burn a
   core. A program with longer serial work between its forks can spin longer, with `par_spin_us(us)`
   (or `GOOSE_PAR_SPIN_US`), at the cost of a core per pool thread for that long after each fork.

@@ -998,6 +998,8 @@ inline void CodeGen::EmitProgramInit() {
                  "    if (gs_program_initialized) return;\n"
                  "    gs_rt_init(argc, argv, ", mainstacks, ", ", mainstacks + globalregions,
            ", ", workerregions, ");\n");
+    // Each pool thread makes its block of stacks as it starts (par_for.h).
+    if (!parthunks.empty()) Append(code, "    gs_par_ready(gs_par_poolstart);\n");
     // The shared libraries' functions, before a global's initializer could
     // call one: on the main thread, before any worker exists, so the
     // pointers are written once here and read thereafter without
