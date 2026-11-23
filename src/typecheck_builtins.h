@@ -511,6 +511,12 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
                          ", got ", TypeStr(StorageType(av))));
         CheckRootedAtReceiver(c, d.name, rv, av, elem, "a reference", "§3.3");
     }
+    // atomic_or, atomic_add and atomic_load: a 64-bit word that par for
+    // iterations share (FastGoose, tools/par_for.md).
+    if ((d.kind == B_ATOMIC_OR || d.kind == B_ATOMIC_ADD || d.kind == B_ATOMIC_LOAD) &&
+        !(elem->kind == TY_INT && (elem->intstorage == IS_U64 || elem->intstorage == IS_I64)))
+        Error(c, cat(".", d.name, " works on i64 and u64 words: ", TypeStr(rv.type), " has ",
+                     TypeStr(elem), " elements"));
     if (d.kind == B_RANGE_INDEX || d.kind == B_CHECK_LENGTH) {
         if (ClassOf(elem) != SC_FIXED)
             Error(c, cat(".", d.name, " needs fixed-size elements: ", TypeStr(rv.type),

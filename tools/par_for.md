@@ -39,7 +39,11 @@ par for v in E BODY        =>  the same with a `const if` on __s's type choosing
 - **Owned arrays (R2):** an enclosing variable `X` that the body reaches only as `X[i]` (i the loop's
   index) or as `X.chunk(i, N)` / `X.chunk_at(B, i)` (N, B an identifier or literal) is passed in as a
   parameter `X` taking `X[..]`, which shadows the outer one, so its writes are the iteration's own and it
-  cannot grow. `&x` over E owns E's elements, so E's root must not appear in the body.
+  cannot grow. `&x` over E owns E's elements, so E's root must not appear in the body. An array the
+  body names only as `X.atomic_or(..)` / `X.atomic_add(..)` / `X.atomic_load(..)` (`ParAtomicForm`) is
+  passed in the same way: the iterations share it, each access one relaxed atomic one to an i64 or u64
+  word (the fork's join
+  orders what main reads after), and no plain access to it can race with them.
 - **R1:** inside the nested function every variable of a function around it is read-only
   (`ParCaptured`, applied where the checker decides writability); a refused write says why and what the
   body may write instead (`ParExplain`, a hook in `TypeCheck::Error`). The body may not redeclare the

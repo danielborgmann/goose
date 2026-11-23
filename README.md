@@ -95,6 +95,27 @@ with these exceptions, which are the iteration's own:
 An owned array cannot grow or shrink in the body. The body's own locals are its own, growable ones
 included. When a write is refused, the error says why and what the body could write instead.
 
+**Shared words.** An array of `u64` or `i64` that the body reaches only through
+`marks.atomic_or(w, bits)`, `counts.atomic_add(w, n)` and `marks.atomic_load(w)` is shared by the
+iterations: each call is one atomic access to word `w`, bounds-checked like `marks[w]`. `atomic_or`
+and `atomic_add` return the word as it was, so an iteration can tell whether it was the one to set a
+bit; an add wraps on overflow, an `i64` one too, also in a debug build. A plain read or write of the array in the same body makes it
+the enclosing function's again, read-only, since a plain access would race with another iteration's
+`atomic_or`; so does passing it to a function. Bind a field to a name first (`let om = vm.omark;`),
+as for an owned array. The words must be 8-byte aligned (an unaligned one is a runtime error), which
+a `u64` array on its own is; one packed into a struct after a field of odd size may not be. Outside a
+`par for` the two are ordinary calls.
+
+```goose
+par for k in parts {                                 // mark the children of part k's frontier
+    for f in frontier.chunk(k, parts) {
+        let j = child(f);
+        let bit = (1 as u64) << (j % 64);
+        if ((marks.atomic_or(j / 64, bit) & bit) == 0) { /* j is newly marked: k's to visit */ }
+    }
+}
+```
+
 **Globals and references.** In the body and in every function it calls, globals are read-only, as
 the variables of the function around the loop are in the body. That carries through references, as
 `const` does: a reference taken to such a variable cannot be written through, wherever it is passed or

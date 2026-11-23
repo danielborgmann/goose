@@ -100,6 +100,9 @@ inline int RecvKindOf(TypeExpr *t) {
     F(B_CAP,              "cap",              1,  1,   "",   "i", BR_LIMITED,     "",            BF_MEMBER | BF_PROPERTY) \
     F(B_INDEX_OF,         "index_of",         2,  2,   "",   "i", BR_INDEXABLE,   "",            BF_MEMBER) \
     F(B_RANGE_INDEX,      "range_index",      2,  3,   "",   "i", BR_INDEXABLE,   "",            BF_MEMBER) \
+    F(B_ATOMIC_OR,        "atomic_or",        3,  3,   "ie", "e", BR_ANY,         "",            BF_MEMBER | BF_WRITE) \
+    F(B_ATOMIC_LOAD,      "atomic_load",      2,  2,   "i",  "e", BR_ANY,         "",            BF_MEMBER) \
+    F(B_ATOMIC_ADD,       "atomic_add",       3,  3,   "ie", "e", BR_ANY,         "",            BF_MEMBER | BF_WRITE) \
     F(B_CHECK_LENGTH,     "check_length",     2,  3,   "i",  "i", BR_GROW | BR_GROWSHRINK, "",     BF_MEMBER) \
     F(B_PUSH,             "push",             2,  2,   "e",  "r", BR_GROWABLE,    "push into",   BF_MEMBER | BF_WRITE) \
     F(B_APPEND,           "append",           2,  2,   "a",  "",  BR_GROWABLE,    "append to",   BF_MEMBER | BF_WRITE) \

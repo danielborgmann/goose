@@ -406,5 +406,7 @@ string ParExplain(const Node *n, const string &msg) {
     return cat("a par for body cannot write ", x, ", a variable of the function around the loop: "
                "iterations run at once, so they only read it. An array the body reaches only as ",
                x, "[", i, "], ", x, ".chunk(", i, ", n) or ", x, ".chunk_at(b, ", i, "), with n and b "
-               "names it does not declare, is the iteration's own to write");
+               "names it does not declare, is the iteration's own to write; one it reaches only "
+               "through ", x, ".atomic_or, ", x, ".atomic_add and ", x, ".atomic_load is shared, "
+               "a 64-bit word at a time");
 }

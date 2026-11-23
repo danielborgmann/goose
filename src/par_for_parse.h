@@ -69,6 +69,27 @@ static bool ParOwnedForm(const Ident *id, const vector<Node *> &up, string_view 
     return false;
 }
 
+// An array the body reaches only as x.atomic_or(...), x.atomic_add(...) and
+// x.atomic_load(...) (or atomic_or(x, ...)) is shared by the iterations, each word written
+// atomically, so it is passed in as an owned array is.
+static bool ParAtomicForm(const Ident *id, const vector<Node *> &up) {
+    if (up.empty()) return false;
+    auto atomic = [](string_view fn) {
+        return fn == "atomic_or" || fn == "atomic_add" || fn == "atomic_load";
+    };
+    auto p = up.back();
+    if (auto d = Is<Dot>(p)) {
+        if (d->obj != id || !atomic(d->name) || up.size() < 2) return false;
+        auto c = Is<Call>(up[up.size() - 2]);
+        return c && c->callee == d && !c->trailing;
+    }
+    if (auto c = Is<Call>(p)) {
+        auto fn = Is<Ident>(c->callee);
+        return fn && atomic(fn->name) && !c->args.empty() && c->args[0] == id && !c->trailing;
+    }
+    return false;
+}
+
 int parcount = 0;
 
 Node *ParsePar() {
@@ -85,7 +106,7 @@ Node *ParsePar() {
     auto idx = elems ? f->idxvar : f->var;
     // What the body names, and how: an enclosing variable it reaches only in
     // an owned form is passed in as the iteration's own (tools/par_for.md).
-    std::map<string_view, int> uses, owneduses;
+    std::map<string_view, int> uses, owneduses, atomicuses;
     std::set<string_view> declared;
     std::map<string_view, vector<string_view>> counts;
     vector<Node *> up;
@@ -104,6 +125,7 @@ Node *ParsePar() {
                 owneduses[id->name]++;
                 counts[id->name].insert(counts[id->name].end(), cs.begin(), cs.end());
             }
+            if (!nest && ParAtomicForm(id, up)) atomicuses[id->name]++;
         }
         auto fv = Is<FunVal>(n);
         if (fv) {
@@ -137,7 +159,8 @@ Node *ParsePar() {
     auto root = elems ? rootof(f->iter) : nullptr;
     vector<string_view> owned;
     for (auto &[nm, n] : uses) {
-        if (owneduses[nm] != n || declared.count(nm) || nm == f->var || nm == f->idxvar ||
+        if ((owneduses[nm] != n && atomicuses[nm] != n) || declared.count(nm) || nm == f->var ||
+            nm == f->idxvar ||
             nm.find("::") != string_view::npos || nm.substr(0, 2) == "__" ||
             (root && root->name == nm))
             continue;

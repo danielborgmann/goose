@@ -26,6 +26,7 @@ static const char *gs_errmsgs[] = {
     "invalid array length",
     "slice not within this array",
     "slice pool span tree is corrupt",
+    "atomic access to a word not 8-byte aligned",
 };
 
 /* Ends the process with `code`, its streams flushed: exit() and every

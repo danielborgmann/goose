@@ -332,6 +332,26 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
             return { cat("(((uint8_t *)(", rx, ") - (uint8_t *)(", v.elems, ")) / ",
                          FixedSize(v.elem), ")") };
         }
+        case B_ATOMIC_OR: case B_ATOMIC_ADD: case B_ATOMIC_LOAD: {
+            // Bounds-checked like xs[i], then one atomic access to the word.
+            auto lv = RecvLoc(an[0]);
+            auto v = ArrayView(lv);
+            auto i = T(), t = T();
+            L("int64_t ", i, " = ", GenX(an[1]), ";");
+            L("(void)GS_IDX(", i, ", ", v.len, ", ", LocArgs(ln), ");");
+            auto at = cat("(uint8_t *)(", ElemAddr(v, i), ")");
+            auto ct = CT(v.elem);
+            auto loc = LocArgs(ln);
+            if (c->builtin == B_ATOMIC_LOAD) {
+                L(ct, " ", t, " = (", ct, ")gs_atomic_load_u64(", at, ", ", loc, ");");
+            } else {
+                auto x = GenX(an[2]);
+                L(ct, " ", t, " = (", ct, ")",
+                  c->builtin == B_ATOMIC_OR ? "gs_atomic_or_u64(" : "gs_atomic_add_u64(", at,
+                  ", (uint64_t)(", x, "), ", loc, ");");
+            }
+            return { t };
+        }
         case B_CHECK_LENGTH: {
             auto lv = RecvLoc(an[0]);
             return { SliceLen(an[1], ArrayView(lv).elem, ln, "GS_E_ARRAYLEN",

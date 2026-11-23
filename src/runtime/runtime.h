@@ -212,6 +212,7 @@ enum {
     GS_E_ARRAYLEN,     /* array element count negative or beyond a data stack */
     GS_E_ARRAYSLICE,   /* a nonempty slice is not wholly inside the array */
     GS_E_SPANTREE,     /* a stdlib slice_pool's nodes and tree are no span tree */
+    GS_E_ATOMICALIGN,  /* an atomic access to a word not 8-byte aligned */
 };
 
 /* A place in the program's source: where a standard library function
@@ -254,6 +255,62 @@ GS_API GS_NORETURN void gs_asfail_f(const char *why, double d, int f32, const ch
 #define GS_IDX(i, n, f, l) \
     ((uint64_t)(i) < (uint64_t)(n) ? (i) \
                                    : (gs_idxfail((int64_t)(i), (n), (f), (l)), (int64_t)0))
+
+/* atomic_or, atomic_add and atomic_load (FastGoose, tools/par_for.md): one
+   access to a 64-bit word that a par for's iterations share (an add wraps, as
+   unsigned arithmetic does, an i64 one too), relaxed, since the fork's
+   join orders what main reads after it. The word must be 8-byte aligned:
+   an atomic access that straddles two cache lines locks the bus, and C
+   compilers make one of a packed word a library call. */
+#define GS_ATOMIC_ALIGNED(p, f, l) \
+    do { if ((uintptr_t)(p) & 7) gs_abort(GS_E_ATOMICALIGN, (f), (l)); } while (0)
+#if defined(__TINYC__)
+/* goose run: a par for runs its iterations in order on one thread, and
+   workers share nothing a store could race with. */
+static inline uint64_t gs_atomic_or_u64(uint8_t *p, uint64_t b, const char *f, int l) {
+    GS_ATOMIC_ALIGNED(p, f, l);
+    uint64_t o = *(uint64_t *)p;
+    *(uint64_t *)p = o | b;
+    return o;
+}
+static inline uint64_t gs_atomic_add_u64(uint8_t *p, uint64_t b, const char *f, int l) {
+    GS_ATOMIC_ALIGNED(p, f, l);
+    uint64_t o = *(uint64_t *)p;
+    *(uint64_t *)p = o + b;
+    return o;
+}
+static inline uint64_t gs_atomic_load_u64(const uint8_t *p, const char *f, int l) {
+    GS_ATOMIC_ALIGNED(p, f, l);
+    return *(const volatile uint64_t *)p;
+}
+#elif defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static __forceinline uint64_t gs_atomic_or_u64(uint8_t *p, uint64_t b, const char *f, int l) {
+    GS_ATOMIC_ALIGNED(p, f, l);
+    return (uint64_t)_InterlockedOr64((volatile __int64 *)p, (__int64)b);
+}
+static __forceinline uint64_t gs_atomic_add_u64(uint8_t *p, uint64_t b, const char *f, int l) {
+    GS_ATOMIC_ALIGNED(p, f, l);
+    return (uint64_t)_InterlockedExchangeAdd64((volatile __int64 *)p, (__int64)b);
+}
+static __forceinline uint64_t gs_atomic_load_u64(const uint8_t *p, const char *f, int l) {
+    GS_ATOMIC_ALIGNED(p, f, l);
+    return (uint64_t)__iso_volatile_load64((const volatile __int64 *)p);
+}
+#else
+static inline uint64_t gs_atomic_or_u64(uint8_t *p, uint64_t b, const char *f, int l) {
+    GS_ATOMIC_ALIGNED(p, f, l);
+    return __atomic_fetch_or((uint64_t *)p, b, __ATOMIC_RELAXED);
+}
+static inline uint64_t gs_atomic_add_u64(uint8_t *p, uint64_t b, const char *f, int l) {
+    GS_ATOMIC_ALIGNED(p, f, l);
+    return __atomic_fetch_add((uint64_t *)p, b, __ATOMIC_RELAXED);
+}
+static inline uint64_t gs_atomic_load_u64(const uint8_t *p, const char *f, int l) {
+    GS_ATOMIC_ALIGNED(p, f, l);
+    return __atomic_load_n((const uint64_t *)p, __ATOMIC_RELAXED);
+}
+#endif
 
 /* Statically unreachable spots (e.g. an ADT tag no variant matches): checked
    in debug builds, an optimizer hint in release. */
