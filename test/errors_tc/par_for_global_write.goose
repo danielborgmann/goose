@@ -1,4 +1,4 @@
-// error: it writes the global counter
+// error: cannot write the global counter, itself or in a function it calls
 // R3: no global writes.
 import std;
 

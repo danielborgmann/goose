@@ -1729,6 +1729,10 @@ struct VarDef {
     // A global's position in ast.globals' definitions (TypeCheck::NoteNarrowed).
     int globalindex = 0;
     bool isparam = false;
+    // A parameter's class root in a function checked for a par for's
+    // iterations, whose call site passed read-only storage
+    // (TypeCheck::ParReadOnlyRoot).
+    bool parreadonly = false;
     // Independently owned fields of a root declaration. These synthetic
     // variables have the owner's scope and stable identities across loop
     // checking passes, but are not source-level bindings.
@@ -2340,6 +2344,9 @@ struct FnSpec {
     // lexparent is where the value was written, its sf the named function
     // whose body that is.
     bool isfunval = false;
+    // Checked for a call made in a par for's iterations, where globals are
+    // read-only (TypeCheck::InParContext): part of the key.
+    bool parreach = false;
     vector<TypeExpr *> argtypes;   // Concrete parameter types (the key, with the below).
     // Aligned with argtypes/params; a parameter holding no roots has the
     // default entry. Every pass uses the parameter index directly.

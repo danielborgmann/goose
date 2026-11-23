@@ -1439,6 +1439,7 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
         Error(callnode, cat(sf->name, " (declared at ", Where(sf->line),
                             ") is called before its declaration is reached (§7.5)"));
     auto narrowedenv = NarrowedOptionals(mi);
+    auto parreach = InParContext();
     // Root classes: distinct roots of ref/slice args ordered by depth.
     vector<RootArg> roots(mi.paramtypes.size());
     vector<RootArg> views(mi.paramtypes.size());
@@ -1670,6 +1671,7 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
         // agreed on (CheckExemplars).
         if (spec->id < exemplarbase) continue;
         if (spec->lexparent != mi.env) continue;
+        if (spec->parreach != parreach) continue;
         if (!spec->inprogress && spec->narrowedenv != narrowedenv) continue;
         // A cycle's member due for its next round is checked again below
         // with what it reads then. A failed one read what it read before
@@ -1789,6 +1791,7 @@ inline FnSpec *TypeCheck::GetOrCreateSpec(MatchInfo &mi, vector<Val> &argvals, N
     auto spec = ast.NewFnSpec();
     spec->sf = sf;
     spec->lexparent = mi.env;
+    spec->parreach = parreach;
     spec->narrowedenv = narrowedenv;
     spec->argtypes = mi.paramtypes;
     spec->roots = roots;
@@ -3152,6 +3155,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
             }
             vd->refrootknown = true;
             vd->ref.writable = ra.writable;
+            if (spec->parreach && !ra.writable && ra.cls > 0) classroots[ra.cls]->parreadonly = true;
             vd->ref.reusable = ra.reusable;
             vd->ref.byteview = ra.byteview;
         } else if (HoldsPlainRef(pt)) {
@@ -3185,6 +3189,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
                 ReachedThroughRefs(pt, classroots[ra.cls]->classreach);
                 exactrefs[ra.cls] = false;
                 cr = classroots[ra.cls];
+                if (spec->parreach && !ra.writable) cr->parreadonly = true;
             }
             vd->contentbyteview = ra.byteview;
             // A returned holder maps back at the call site through it, and a
@@ -3241,6 +3246,7 @@ inline void TypeCheck::CheckSpecBodyOnce(FnSpec *spec, vector<Val> *argvals, Lin
             ReachedThroughRefs(pt->ref->sub, rv->classreach);
             rv->poolclass = false;
             if (!va.pool) rv->classpool = nullptr;
+            if (spec->parreach && !va.writable) rv->parreadonly = true;
             rv->contentbyteview |= va.byteview;
             if (pt->ref->sub->kind == TY_SLICE || !va.heldexact)
                 exactrefs[va.cls] = false;

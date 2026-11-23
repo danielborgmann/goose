@@ -47,7 +47,19 @@ par for v in E BODY        =>  the same with a `const if` on __s's type choosing
 - **R4:** `return` and a `break` of the marked loop are checker errors; `continue` ends the iteration.
 - **R3:** a pass after checking, over the nested function's specialization and everything it calls:
   print, exit, threads and queues, a write to a global, an extern that is not pure (pure: from `std`,
-  `math` or `binary`, with only scalar or `const` view parameters).
+  `math` or `binary`, its parameters scalars, `const` views, or writable references or slices of
+  numbers, its out-parameters).
+- **Globals and references, in the checker.** A syntactic pass cannot follow a reference, so R3's
+  global writes are also the checker's. A specialization checked for a call in a par for's iterations
+  has `FnSpec::parreach`, part of the key (`InParContext`), and there `ParCaptured` holds for every
+  global, so that a global is read-only as a `const` is and every reference taken to it is too
+  (§9.5). Since `const` is shallow, a reference read out of a field or an element is in addition writable
+  there only if its path is and none of the roots it may point into is read-only (`ParWritableLoad`):
+  static data, a global, a captured variable, or the class root of a
+  parameter whose call site passed read-only storage (`VarDef::parreadonly`).
+- **`GOOSE_PAR_ALL`:** a survey that reports every refusal, not the first per loop: those rules are off
+  while checking, `ParSurveyWrites` lists direct writes to captured variables and `ParSurveyEffects` every
+  effect with its call chain. It follows no references, so it builds nothing.
 - **Names:** the nested function is `__par<file>_<n>`, by file and order, so a file parses to the same
   program each time (`goose format --verify` compares two parses).
 - **The fork** (`src/par_for.h`): the call's C arguments, but the range, go into an environment struct

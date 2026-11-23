@@ -1,4 +1,4 @@
-// error: calls bump, which writes the global counter
+// error: cannot write the global counter, itself or in a function it calls
 // R3: effects are found through calls.
 import std;
 

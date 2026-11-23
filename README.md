@@ -95,10 +95,27 @@ with these exceptions, which are the iteration's own:
 An owned array cannot grow or shrink in the body. The body's own locals are its own, growable ones
 included. When a write is refused, the error says why and what the body could write instead.
 
+**Globals and references.** In the body and in every function it calls, globals are read-only, as
+the variables of the function around the loop are in the body. That carries through references, as
+`const` does: a reference taken to such a variable cannot be written through, wherever it is passed or
+stored. A reference read out of a struct or an array is writable only if everything it may point to
+is the iteration's own, so a struct from outside the loop that holds a writable reference does not
+let the body write through it. To hand the iterations shared tables in a context struct, declare
+those fields `const` (`tab: const T[>..]&`); fields that point to the body's own locals can stay
+writable. A function that both main and a body call is checked separately for the body: it keeps
+its writes for main, and only the body's version refuses them.
+
 **What a body may not do**, also inside any function it calls: print, exit, spawn or wait for threads,
 use queues, write a global, or call an extern outside the standard library's pure ones (`std`, `math`,
-`binary`, with only scalar or `const` view parameters). A body cannot `return` or `break` out of the
-loop; `continue` ends one iteration.
+`binary`, whose parameters are scalars, `const` views, or numbers it writes back: `i32&`, `f64[:]`).
+A body cannot `return` or `break` out of the loop; `continue` ends one iteration.
+
+**Every refusal at once.** A check stops a loop at its first refusal. When porting much code to
+`par for`, set `GOOSE_PAR_ALL=1` and one check lists them all: every direct write to a variable of
+the function around the loop, and every effect in the body or in any function it calls (the latter
+with the calls that led there). The list is a survey, not the check itself: it does not follow
+references, so a write through one (to a global, say) shows only in the normal check. So under it
+the compile always fails, and the normal check, after the fixes, has the last word.
 
 **The one gap**, which the design note accepts: two variables that are views of the same array, one
 written as the iteration's own and the other read, are not told apart, so such a body can read

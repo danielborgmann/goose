@@ -255,8 +255,9 @@ inline void TypeCheck::ReadBackLVal(LVal &lv) {
     lv.freshview = false;
     lv.reached = nullptr;
     lv.intemp = false;
-    lv.writable = lv.isslot ? SlotLoadWritable(lv.type, lv.writable)
-                            : lv.writable && !lv.type->cq;
+    auto path = lv.writable;
+    lv.writable = lv.isslot ? SlotLoadWritable(lv.type, path) : path && !lv.type->cq;
+    if (lv.writable && InParContext()) lv.writable = ParWritableLoad(lv, path);
 }
 
 // How writable a reference or slice loaded out of a field or an element of
