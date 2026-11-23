@@ -4,8 +4,8 @@ This is a fork of [aardappel/goose](https://github.com/aardappel/goose) that mak
 fast. It follows upstream `master`: each change sits on top of it as a small, self-contained commit
 that could go upstream as a pull request. Everything below this section is upstream's README.
 
-It also adds one language feature that upstream does not have yet, `par for` (below). Code that uses it
-builds only with this compiler.
+It also adds two language features that upstream does not have, `par for` and racy views (below).
+Code that uses them builds only with this compiler.
 
 A speed change here must not change what the compiler produces. The generated C is byte-identical to
 upstream's on the programs we measure, the test suite gives the same result, and every cache can check
@@ -59,36 +59,130 @@ The unit holding the startup code that gives every global its initial value is c
 optimization: it runs once, and optimizing its megabytes of initializers took several seconds after
 any edit to a global.
 
-## `par for`: parallel loops (this fork's, not upstream's)
+## Threads that share memory: `par for` and racy views (this fork's, not upstream's)
+
+Upstream's threads share nothing: a worker gets copies of its arguments and talks to main through
+queues. This fork adds two ways for threads to use the same memory, each checked by the compiler so
+that a data race cannot break memory safety. Code that uses either builds only with this compiler.
+
+### `par for`: parallel loops
 
 An implementation of the loops in upstream's design note
 [docs/design/child_threads.md](docs/design/child_threads.md), in its syntax, for programs that cannot
-wait for upstream's own version; when that lands we follow it. Each iteration may read anything and
-write only what is its own; the compiler checks this, so a loop that compiles gives the same result on
-any number of threads. The one gap, which the note accepts: two variables that are views of the same
-array, one written as the iteration's own and the other read, are not told apart.
+wait for upstream's own version; when that lands we follow it. The iterations of a `par for` run at the
+same time on a pool of threads. The compiler checks that each iteration reads anything but writes only
+what is its own, so a loop that compiles gives the same result as the plain `for` it would be, on any
+number of threads.
 
 ```goose
 par for i in n { out[i] = f(xs[i]); }                 // out[i] is this iteration's element
-par for &x, i in xs { x = x * 2 + i; }               // so is each x of xs
+par for i in a..b { out[i] = g(i); }                  // a range
+par for &x, i in xs { x = x * 2 + i; }               // each x of xs is its iteration's own
+par for v, i in xs { sums[i] = weight(v); }          // v a copy, sums[i] owned
 par for k in parts {                                  // a contiguous run of out per k
     for &v in out.chunk(k, parts) { v = k; }
 }
 ```
 
-- An array of the enclosing function that the body reaches only as `out[i]` (with `i` the loop's
-  index), `out.chunk(i, n)` or `out.chunk_at(bounds, i)` is the iteration's own to write. Every other
-  variable of the enclosing function is read-only in the body.
-- The body cannot print, exit, use threads or queues, write a global, or call an extern outside the
-  standard library's pure ones, directly or through what it calls. It cannot `return` or `break` out
-  of the loop; `continue` ends one iteration.
-- The iterations run in chunks on a pool of threads (`GOOSE_THREADS`, by default one per CPU) that
-  the first loop starts. A loop inside a loop's body, a loop in a contained worker, and every loop
-  under `GOOSE_THREADS=1` or `goose run` run as plain loops.
-- A body may have growable locals, and call functions that do: on a pool thread it runs on that
-  thread's own data stacks, emptied after each chunk.
-- `bench/fork_cost/par_cost.goose` measures what a fork and join costs, and a tree walk per iteration
-  with a growable work list.
+**What a body may write.** The variables of the function around the loop are read-only in the body,
+with these exceptions, which are the iteration's own:
+
+- an array that the body reaches only as `out[i]`, where `i` is the loop's index;
+- an array that the body reaches only as `out.chunk(i, n)` (the i-th of n contiguous runs) or
+  `out.chunk_at(bounds, i)` (the run between `bounds[i]` and `bounds[i + 1]`), from `std`;
+- in `par for &x in xs`, each `x`, as long as the body does not name `xs` itself.
+
+An owned array cannot grow or shrink in the body. The body's own locals are its own, growable ones
+included. When a write is refused, the error says why and what the body could write instead.
+
+**What a body may not do**, also inside any function it calls: print, exit, spawn or wait for threads,
+use queues, write a global, or call an extern outside the standard library's pure ones (`std`, `math`,
+`binary`, with only scalar or `const` view parameters). A body cannot `return` or `break` out of the
+loop; `continue` ends one iteration.
+
+**The one gap**, which the design note accepts: two variables that are views of the same array, one
+written as the iteration's own and the other read, are not told apart, so such a body can read
+elements another iteration is writing.
+
+**How it runs.**
+
+- The first `par for` starts a pool of threads: `GOOSE_THREADS` in all if that is set, else one per
+  CPU, within the program's thread cap. The thread that forks takes part too.
+- A loop is cut into 4 chunks per thread, which the threads claim one at a time, so uneven iterations
+  even out. The loop ends when every chunk is done.
+- Between loops the pool threads spin briefly (4096 pause instructions), then sleep on a condition
+  variable: a program that forks in a tight loop does not pay a wake-up each time, and an idle one does
+  not burn a core.
+- A body with growable locals, or one calling functions that have them, runs on the pool thread's own
+  data stacks, which are emptied after each chunk.
+- These run as plain loops, in order, on the thread that reaches them: a `par for` inside another's
+  body, one in a contained worker, one that starts while another fork runs, every loop under
+  `GOOSE_THREADS=1`, and every loop under `goose run` (TinyCC).
+
+**What it costs.** A fork and join is a few atomic operations plus waking the pool, so it pays when a
+loop does at least several microseconds of work; a few hundred cheap iterations are usually faster as a
+plain `for`. `bench/fork_cost/par_cost.goose` measures the fork and join on its own, loops with work in
+them, and a tree walk per iteration with a growable work list. Run it with and without
+`GOOSE_THREADS=1` to see the gain on your machine.
+
+### Racy views: a worker reading main's arrays in place
+
+A worker that needs much of main's data while main keeps running and changing it (a JIT compiling on
+a background thread, say) cannot afford a snapshot copy per job. A racy view lets it read main's
+arrays where they are. What it reads may be stale, or mixed from before and after one of main's
+changes, and the worker must tolerate that, for instance by having main check an epoch before using
+its result. What it cannot do is read outside main's memory, or crash on what it reads.
+
+```goose
+struct Vm { code: Op[>..]&, shapes: Shape[>..<]&, epoch: i64 = 0 }
+
+fn count_dicts(vm) -> i64 {           // untyped: one body for Vm& and racy Vm
+    var n = 0;
+    for i in vm.shapes.len { if vm.shapes[i].dict { n++; } }
+    return n;
+}
+
+thread_fn compile(vm: racy Vm, job: i64) {
+    qput(Result { job: job, epoch: vm.epoch, dicts: count_dicts(vm) });
+}
+
+fn main() {
+    // ... build vm ...
+    let w = thread_spawn_contained(compile, racy(vm), 1);
+    // main goes on changing vm; it uses a result only if its epoch still matches
+}
+```
+
+- `racy(xs)` of a resizable array `T[>..]` or `T[>..<]` gives a `racy T[:]`. `racy(s)` of a struct
+  gives a `racy S`, whose fields that are references to resizable arrays read as their own
+  `racy T[:]`. Only main makes views: a worker's arrays end with the worker.
+- The elements must be plain data: integers, floats, bools, and fixed arrays, structs and fixed-mode
+  enums of those. A view reads `v[i]`, `v.len` and the fields of a struct view, nothing else. Writing
+  through it, taking `&v[i]`, and `for x in v` are compile errors (read by index). Reading a field that
+  is any other kind of reference is a compile error too, so a struct may hold some the worker leaves
+  alone.
+- A view is a type of its own and cannot be passed where `T[:]` is expected. Write the code that reads
+  it with untyped parameters, as above, and the same body compiles for main's `Vm&` and the worker's
+  view. A write in such a body fails to compile only in the view's version, which shows exactly where
+  a job would write.
+- A view lives in locals, parameters and results only, and reaches a worker as a `thread_spawn`
+  argument. Spawn racy readers with `thread_spawn_contained`: a bounds check that fails on a length
+  that just shrank then ends only that job.
+
+**How it stays safe.** Goose never moves an array's elements, and a data stack's memory stays mapped
+until the program ends, so the base a view takes stays valid. Each read checks its index against the
+length main last stored, and also against the end of the memory region the array lies in, so a stale
+or garbage length cannot reach unmapped memory. Each element is copied with one volatile load per
+word: the C compiler cannot load it a second time, so the value checked is the value used. After the
+copy a bool is made 0 or 1, and an enum's tag must name one of its variants or the read fails (a stray
+tag in a `match` could otherwise jump anywhere). On Windows a worker's page-fault handler also commits
+pages of main's regions it touches, which read as zeros.
+
+**What it costs.** Main's code does not change: no barrier and no check on its writes, and a program
+without views compiles to exactly the C it did before. A read through a view costs a bounds check, the
+copy, and for bools and enums the check of its bits.
+
+The design notes are [tools/par_for.md](tools/par_for.md) and [tools/racy_views.md](tools/racy_views.md).
 
 ## Other additions
 
