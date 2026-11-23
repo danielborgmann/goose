@@ -199,13 +199,65 @@ struct Builder {
     // program's units) with `objects` and the response files `rsps` into
     // `exe`. It runs in the units' directory, where the response file names
     // them bare: clang-cl hands link.exe its arguments as one line, which
-    // link.exe refuses past 128K characters, about 1000 full paths.
+    // link.exe refuses past 128K characters, about 1000 full paths. Every
+    // other path it is given is absolute, the response files' included
+    // (RebasedLinkFile).
     // GOOSE_SPLIT_LTO=1 (experimental): a split program's units are compiled
     // to ThinLTO bitcode and linked by lld, which inlines across them, with a
     // cache of its own under the units' directory. clang and clang-cl only.
     bool SplitLTO() const {
         auto e = getenv("GOOSE_SPLIT_LTO");
         return e && *e && strcmp(e, "0") && (tc.name == "clang-cl" || tc.name == "clang");
+    }
+
+    // The response file `rsp` for a link run in another directory: a copy
+    // under `dir`, the `k`th, whose relative paths that name a file from the
+    // working directory are absolute (a package's c_libs name libraries from
+    // where the build runs).
+    string RebasedLinkFile(const string &rsp, const string &dir, size_t k) const {
+        string text;
+        if (opts.dryrun || !LoadFile(rsp, text)) return AbsolutePath(rsp);
+        // cc-style files escape backslashes and quotes inside quotes.
+        auto cc = tc.style != "msvc";
+        string out;
+        std::error_code ec;
+        for (size_t i = 0; i < text.size();) {
+            auto end = text.find('\n', i);
+            if (end == string::npos) end = text.size();
+            auto line = text.substr(i, end - i);
+            i = end + 1;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            auto item = line;
+            if (item.size() > 1 && item.front() == '"' && item.back() == '"') {
+                item = item.substr(1, item.size() - 2);
+                if (cc) {
+                    string u;
+                    for (size_t j = 0; j < item.size(); j++) {
+                        if (item[j] == '\\' && j + 1 < item.size()) j++;
+                        u += item[j];
+                    }
+                    item = u;
+                }
+            }
+            if (!item.empty() && item[0] != '-' && filesystem::path(item).is_relative() &&
+                filesystem::is_regular_file(filesystem::path(item), ec)) {
+                auto abs = AbsolutePath(item);
+                if (cc) {
+                    line = "\"";
+                    for (auto c : abs) {
+                        if (c == '\\' || c == '"') line += '\\';
+                        line += c;
+                    }
+                    line += '"';
+                } else {
+                    line = abs.find(' ') != string::npos ? cat("\"", abs, "\"") : abs;
+                }
+            }
+            Append(out, line, "\n");
+        }
+        auto dest = cat(AbsolutePath(dir), "/link-", k, ".rsp");
+        if (!WriteFileIfChanged(dest, out)) throw CompileError { cat("cannot write ", dest) };
+        return dest;
     }
 
     bool LinkObjects(const string &unitsrsp, const vector<string> &objects,
@@ -223,7 +275,8 @@ struct Builder {
                 argv.push_back(cat("/Fd:", AbsolutePath(builddir), "\\", PathStem(exe), ".pdb"));
             argv.push_back(cat("@", AbsolutePath(unitsrsp)));
             for (auto &o : objects) argv.push_back(AbsolutePath(o));
-            for (auto &r : rsps) argv.push_back(cat("@", AbsolutePath(r)));
+            for (size_t k = 0; k < rsps.size(); k++)
+                argv.push_back(cat("@", RebasedLinkFile(rsps[k], builddir, k)));
             if (lto) {
                 argv.push_back("/link");
                 argv.push_back(cat("/lldltocache:", AbsolutePath(ltocache)));
@@ -233,7 +286,8 @@ struct Builder {
             for (auto &o : objects) argv.push_back(AbsolutePath(o));
             argv.push_back("-o");
             argv.push_back(exepath);
-            for (auto &r : rsps) argv.push_back(cat("@", AbsolutePath(r)));
+            for (size_t k = 0; k < rsps.size(); k++)
+                argv.push_back(cat("@", RebasedLinkFile(rsps[k], builddir, k)));
             for (auto &l : SystemLibs()) argv.push_back(l);
             if (lto) argv.push_back(cat("-Wl,--thinlto-cache-dir=", AbsolutePath(ltocache)));
         }
