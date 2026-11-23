@@ -88,14 +88,15 @@ struct Builder {
 
     // Runs `argv`, `what` being what it does ("compiling the runtime"), with
     // its output kept in `logfile`. False when it failed, after saying so.
-    bool Run(const vector<string> &argv, const string &what, const string &logfile) const {
+    bool Run(const vector<string> &argv, const string &what, const string &logfile,
+             const string &cwd = "") const {
         if (opts.dryrun || opts.verbose) fprintf(msgs, "%s\n", CommandLineText(argv).c_str());
         if (opts.dryrun) return true;
         fflush(msgs);
         ProcessResult r;
         {
             ProgressStep step(what);
-            r = RunProcess(argv, "", opts.verbose);
+            r = RunProcess(argv, cwd, opts.verbose);
         }
         if (!logfile.empty()) WriteFileMakingDirs(logfile, r.output);
         if (r.started && r.code == 0) return true;
@@ -196,7 +197,9 @@ struct Builder {
 
     // Links the objects the response file `unitsrsp` names (a split
     // program's units) with `objects` and the response files `rsps` into
-    // `exe`.
+    // `exe`. It runs in the units' directory, where the response file names
+    // them bare: clang-cl hands link.exe its arguments as one line, which
+    // link.exe refuses past 128K characters, about 1000 full paths.
     // GOOSE_SPLIT_LTO=1 (experimental): a split program's units are compiled
     // to ThinLTO bitcode and linked by lld, which inlines across them, with a
     // cache of its own under the units' directory. clang and clang-cl only.
@@ -211,27 +214,30 @@ struct Builder {
         vector<string> argv = { tc.cc };
         for (auto &f : CFlags()) argv.push_back(f);
         auto lto = !ltocache.empty();
+        auto unitsdir = filesystem::path(AbsolutePath(unitsrsp)).parent_path().string();
+        auto exepath = AbsolutePath(exe);
         if (lto) argv.push_back("-fuse-ld=lld");
         if (tc.style == "msvc") {
-            argv.push_back(cat("/Fe:", exe));
-            if (opts.debug) argv.push_back(cat("/Fd:", builddir, "\\", PathStem(exe), ".pdb"));
-            argv.push_back(cat("@", unitsrsp));
-            for (auto &o : objects) argv.push_back(o);
-            for (auto &r : rsps) argv.push_back(cat("@", r));
+            argv.push_back(cat("/Fe:", exepath));
+            if (opts.debug)
+                argv.push_back(cat("/Fd:", AbsolutePath(builddir), "\\", PathStem(exe), ".pdb"));
+            argv.push_back(cat("@", AbsolutePath(unitsrsp)));
+            for (auto &o : objects) argv.push_back(AbsolutePath(o));
+            for (auto &r : rsps) argv.push_back(cat("@", AbsolutePath(r)));
             if (lto) {
                 argv.push_back("/link");
-                argv.push_back(cat("/lldltocache:", ltocache));
+                argv.push_back(cat("/lldltocache:", AbsolutePath(ltocache)));
             }
         } else {
-            argv.push_back(cat("@", unitsrsp));
-            for (auto &o : objects) argv.push_back(o);
+            argv.push_back(cat("@", AbsolutePath(unitsrsp)));
+            for (auto &o : objects) argv.push_back(AbsolutePath(o));
             argv.push_back("-o");
-            argv.push_back(exe);
-            for (auto &r : rsps) argv.push_back(cat("@", r));
+            argv.push_back(exepath);
+            for (auto &r : rsps) argv.push_back(cat("@", AbsolutePath(r)));
             for (auto &l : SystemLibs()) argv.push_back(l);
-            if (lto) argv.push_back(cat("-Wl,--thinlto-cache-dir=", ltocache));
+            if (lto) argv.push_back(cat("-Wl,--thinlto-cache-dir=", AbsolutePath(ltocache)));
         }
-        return Run(argv, cat("linking ", exe), logfile);
+        return Run(argv, cat("linking ", exe), logfile, unitsdir);
     }
 };
 
@@ -350,11 +356,8 @@ inline string BuildSplitUnits(const Builder &b, const vector<SplitUnit> &units,
         return "";
     }
     string list;
-    for (auto &o : objs) {
-        auto path = o;
-        for (auto &c : path) if (c == '\\') c = '/';
-        Append(list, "\"", path, "\"\n");
-    }
+    // Bare names: the link runs in this directory (Builder::LinkObjects).
+    for (auto &o : objs) Append(list, "\"", filesystem::path(o).filename().string(), "\"\n");
     if (!WriteFileMakingDirs(rsp, list)) throw CompileError { cat("cannot write ", rsp) };
     return rsp;
 }
