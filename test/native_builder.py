@@ -82,4 +82,27 @@ def check_native_builder(exe, base, *, jit):
         expect([app], ["<ababab>", "8"], "the program using a CMake package")
         if jit:
             expect([exe, "run", user], ["<ababab>", "8"], "goose run of a CMake package")
+
+        # A library a program's c_libs names by a path relative to where the
+        # build runs, linked split too, whose link runs in another directory
+        # (FastGoose's: build.h RebasedLinkFile). The library is the one CMake
+        # just built. msvc style only: a cc-style c_libs entry is a -l name.
+        if (info.get("cc") or {}).get("style") != "msvc":
+            return None
+        built = sorted((root / "home").rglob("fillpkg.lib"))
+        if not built:
+            raise RuntimeError("native builder: CMake built no fillpkg.lib under GOOSE_HOME")
+        libdir = root / "libs"
+        libdir.mkdir(exist_ok=True)
+        (libdir / "fillpkg.lib").write_bytes(built[0].read_bytes())
+        source = root / "rel.goose"
+        program(source, "extern fn fillpkg_ab(out: u8[>..]&, n: i64);\n", "fillpkg_ab")
+        tc.write_text(root / "rel_glue.c", "int rel_glue(void) { return 0; }\n")
+        tc.write_text(root / "rel.build",
+                      'c_sources = ["rel_glue.c"];\nc_libs = ["libs/fillpkg"];\n')
+        for flags, what in (([], "goose build"), (["--split"], "goose build --split")):
+            app = root / ("rel" + tc.EXE_SUFFIX)
+            expect([exe, "build", *flags, "-o", app, source], None,
+                   f"{what} with a relative c_libs path")
+            expect([app], ["<ababab>", "8"], f"the program of {what} with a relative c_libs path")
     return None
