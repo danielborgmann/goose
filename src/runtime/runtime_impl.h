@@ -351,6 +351,9 @@ static size_t gs_page_size = 0;
 /* The vectored handler gs_regions_init registered, for gs_fault_uninstall. */
 static void *gs_fault_handle;
 #define GS_COMMIT_CHUNK (1u << 20)
+/* A region's first commit, which each one after doubles up to
+   GS_COMMIT_CHUNK (gs_fault_filter). */
+#define GS_COMMIT_FIRST (64u << 10)
 /* What each thread program keeps of its native stack for reporting that
    stack's overflow (gs_native_stack_init). */
 #define GS_STACK_GUARANTEE (64u << 10)
@@ -388,10 +391,15 @@ static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
         if ((uintptr_t)hit - (uintptr_t)r->base < r->size) {
             /* Within the usable part: commit another chunk (clamped to the
                region) and resume, or where the system has no more memory to
-               commit, say so. Within the gap: a data stack overran. */
+               commit, say so. Within the gap: a data stack overran. A chunk
+               is as large as what the region has committed so far, from
+               GS_COMMIT_FIRST up to GS_COMMIT_CHUNK: a stack that stays small
+               is charged little, and one that grows faults about as often. */
             if (hit < r->base + r->usable) {
                 uint8_t *page = (uint8_t *)((size_t)hit & ~(gs_page_size - 1));
-                size_t n = GS_COMMIT_CHUNK;
+                size_t n = (size_t)(r->committed - r->base);
+                if (n < GS_COMMIT_FIRST) n = GS_COMMIT_FIRST;
+                if (n > GS_COMMIT_CHUNK) n = GS_COMMIT_CHUNK;
                 if (page + n > r->base + r->usable)
                     n = (size_t)(r->base + r->usable - page);
                 if (VirtualAlloc(page, n, MEM_COMMIT, PAGE_READWRITE)) {
