@@ -67,9 +67,13 @@ par for v in E BODY        =>  the same with a `const if` on __s's type choosing
   `gs_nstks` and `gs_gl`; a thunk per call takes those and calls the function on a chunk;
   `gs_par(thunk, &env, lo, hi)` runs it. The optimizer never inlines a par for's function.
 - **The pool** (`runtime_threads.h`, `gs_par_run`): made at the first fork, `GOOSE_THREADS` threads in
-  all or one per CPU. A fork is cut into 4 chunks per thread, claimed through one word holding the fork's
-  number, chunk count and next chunk; the forking thread runs chunks too, then waits for the rest. Pool
-  threads spin 4096 pauses for the next fork, then sleep on a condition variable. A program with a par
+  all or one per CPU, or on a hybrid CPU under Windows one per CPU of the performance cores (the
+  highest `EfficiencyClass`), with the pool's threads held to them. `par_threads(n)` asks for another
+  size; the next fork stops the pool and starts one of that size. A fork is cut into 4 chunks per
+  thread, claimed through one word holding the fork's number, chunk count and next chunk; the forking
+  thread runs chunks too, then waits for the rest. Pool threads spin for the next fork, 200 us or
+  `par_spin_us`/`GOOSE_PAR_SPIN_US` (a 13900HX's 4096 pauses, the old spin: 170 us on a P core, 75 on
+  an E core), then sleep on a condition variable. A program with a par
   for and no threads gets `GS_PAR`, which turns on `GS_NEED_THREADS` except in a JIT run.
 - **Bodies that need data stacks** (`gs_sp`): the thunk is written once the stack counts are known
   (`EmitParThunks`). On the forking thread it calls the function at the fork's `gs_sp`; on a pool thread

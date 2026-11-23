@@ -76,6 +76,8 @@ inline int RecvKindOf(TypeExpr *t) {
     F(B_ABORT,            "abort",            1,  1,   "",   "",  0,              "",            0) \
     F(B_EXIT,             "exit",             1,  1,   "",   "",  0,              "",            0) \
     F(B_HARDWARE_THREADS, "hardware_threads", 0,  0,   "",   "i", 0,              "",            0) \
+    F(B_PAR_THREADS,      "par_threads",      1,  1,   "i",  "i", 0,              "",            0) \
+    F(B_PAR_SPIN_US,      "par_spin_us",      1,  1,   "i",  "i", 0,              "",            0) \
     F(B_THREAD_SPAWN,     "thread_spawn",     1, 99,   "",   "i", 0,              "",            0) \
     F(B_THREAD_SPAWN_CONTAINED, "thread_spawn_contained", 1, 99, "", "i", 0,       "",            0) \
     F(B_THREAD_WAIT,      "thread_wait",      1,  2,   "",   "",  0,              "append to",   BF_OUTARG) \
@@ -84,7 +86,8 @@ inline int RecvKindOf(TypeExpr *t) {
     F(B_QPOLL,            "qpoll",            0,  0,   "",   "",  0,              "",            BF_TYARGS) \
     F(B_QLIMIT,           "qlimit",           1,  1,   "",   "",  0,              "",            BF_TYARGS) \
     F(B_DEFAULT,          "default",          0,  0,   "",   "",  0,              "",            BF_TYARGS) \
-    F(B_COPY,             "copy",             1,  1,   "",   "",  0,              "",            0)     F(B_RACY,             "racy",             1,  1,   "",   "",  0,              "",            0) \
+    F(B_COPY,             "copy",             1,  1,   "",   "",  0,              "",            0) \
+    F(B_RACY,             "racy",             1,  1,   "",   "",  0,              "",            0) \
     F(B_MOVE_FROM,        "move_from",        2,  2,   "",   "",  BR_SLICE,       "",            BF_MEMBER | BF_WRITE) \
     F(B_TO_BYTES,         "to_bytes",         1,  2,   "",   "",  BR_ANY,         "append to",   BF_MEMBER | BF_OUTARG) \
     F(B_BYTES_OF,         "bytes_of",         1,  1,   "",   "",  BR_ANY,         "",            BF_MEMBER) \

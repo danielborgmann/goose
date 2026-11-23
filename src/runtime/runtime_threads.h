@@ -485,7 +485,8 @@ static int gs_par_cas(volatile int64_t *p, int64_t old, int64_t nw) {
 #define gs_par_yield()          sched_yield()
 #endif
 
-#define GS_PAR_SPIN 4096        /* Pauses a pool thread waits for a fork before it sleeps. */
+#define GS_PAR_SPIN 4096        /* Pauses the forking thread waits for the chunks before it yields. */
+#define GS_PAR_SPIN_US 200      /* How long a pool thread waits for a fork before it sleeps. */
 #define GS_PAR_CHUNKS 4         /* Chunks per thread, for the uneven loops. */
 
 static struct {
@@ -501,10 +502,132 @@ static volatile int64_t gs_par_live;      /* Pool threads running. */
 static volatile int64_t gs_par_quit;
 static int64_t gs_par_forks;
 static int64_t gs_par_threads;            /* The forking thread and the pool's; 0 until the first fork. */
+static int64_t gs_par_asked;              /* The size the pool was started for. */
+static int64_t gs_par_wanted;             /* gs_par_want when it was. */
+static volatile int64_t gs_par_want;      /* par_threads: the size asked for, 0 the default. */
+static volatile int64_t gs_par_spin_ns = -1;  /* par_spin_us, in ns; -1 not set. */
+#ifdef _WIN32
+static uint64_t gs_par_pmask;             /* Pool threads' affinity on a hybrid CPU, 0 for none. */
+#endif
 static gs_mutex gs_par_mutex = GS_MUTEX_INIT;
 static gs_cond gs_par_wake = GS_COND_INIT;
 static GS_TLS int gs_in_par;              /* In a fork's body: a fork here runs sequentially. */
 static GS_TLS int gs_par_pooled;          /* A pool thread, which has a stack block of its own. */
+
+/* A monotonic clock for the pool's spin (the os layer's comes later). */
+static int64_t gs_par_now_ns(void) {
+#ifdef _WIN32
+    static double tons;
+    if (!tons) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        tons = 1e9 / (double)f.QuadPart;
+    }
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return (int64_t)((double)c.QuadPart * tons);
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+#endif
+}
+
+/* How long a pool thread spins before it sleeps: par_spin_us, else
+   GOOSE_PAR_SPIN_US, else GS_PAR_SPIN_US. */
+static int64_t gs_par_spin(void) {
+    int64_t ns = gs_par_load(&gs_par_spin_ns);
+    if (ns >= 0) return ns;
+    const char *env = getenv("GOOSE_PAR_SPIN_US");
+    ns = (env && *env ? (int64_t)strtoll(env, NULL, 10) : GS_PAR_SPIN_US) * 1000;
+    if (ns < 0) ns = 0;
+    if (ns > 1000000000) ns = 1000000000;
+    gs_par_store(&gs_par_spin_ns, ns);
+    return ns;
+}
+
+/* The pool's size by default: GOOSE_THREADS in all, else one thread for each
+   CPU the process may run on, but on a hybrid CPU one for each of the
+   performance cores' CPUs, which the pool's threads are then held to: a
+   fork waits for its slowest chunk, which is one on an efficiency core (on
+   a 13900HX against all 32 CPUs: a fork and join twice as fast, a long loop
+   of pure arithmetic 1.9 times slower). Windows only for now: elsewhere one
+   per CPU. */
+static int64_t gs_par_default(void) {
+    const char *env = getenv("GOOSE_THREADS");
+    if (env && *env) return (int64_t)strtoll(env, NULL, 10);
+    int64_t n = gs_os_threads();
+#ifdef _WIN32
+    /* Windows 7's, looked up: the runtime builds for Vista (runtime.h). */
+    typedef BOOL (WINAPI *info_fn)(LOGICAL_PROCESSOR_RELATIONSHIP,
+                                   PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, PDWORD);
+    HMODULE k32 = GetModuleHandleW(L"kernel32.dll");
+    info_fn info = k32 ? (info_fn)(void (*)(void))GetProcAddress(k32,
+                                                                  "GetLogicalProcessorInformationEx")
+                       : NULL;
+    DWORD_PTR proc, sys;
+    DWORD len = 0;
+    if (!info || !GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) return n;
+    info(RelationProcessorCore, NULL, &len);
+    char *buf = len ? (char *)malloc(len) : NULL;
+    if (!buf) return n;
+    if (info(RelationProcessorCore, (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)buf, &len)) {
+        int lo = 255, hi = -1;
+        for (DWORD off = 0; off < len;) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *p =
+                (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + off);
+            if (p->Processor.GroupMask[0].Group == 0 && (p->Processor.GroupMask[0].Mask & proc)) {
+                int c = p->Processor.EfficiencyClass;
+                if (c < lo) lo = c;
+                if (c > hi) hi = c;
+            }
+            off += p->Size;
+        }
+        if (hi > lo) {
+            uint64_t mask = 0;
+            for (DWORD off = 0; off < len;) {
+                SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *p =
+                    (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX *)(buf + off);
+                uint64_t m = (uint64_t)(p->Processor.GroupMask[0].Mask & proc);
+                if (p->Processor.GroupMask[0].Group == 0 && m &&
+                    p->Processor.EfficiencyClass == hi)
+                    mask |= m;
+                off += p->Size;
+            }
+            if (mask) {
+                n = 0;
+                for (uint64_t m = mask; m; m &= m - 1) n++;
+                gs_par_pmask = mask;
+            }
+        }
+    }
+    free(buf);
+#endif
+    return n;
+}
+
+/* The size the next fork's pool has: par_threads, else the default, within
+   the program's thread cap. */
+static int64_t gs_par_size(void) {
+    int64_t n = gs_par_load(&gs_par_want);
+    #ifdef _WIN32
+        gs_par_pmask = 0;
+    #endif
+    int64_t d = gs_par_default();
+    if (n <= 0) n = d;
+    #ifdef _WIN32
+        /* Held to the performance cores only while it fits on them. */
+        if (gs_par_pmask) {
+            int64_t logical = 0;
+            for (uint64_t m = gs_par_pmask; m; m &= m - 1) logical++;
+            if (n > logical) gs_par_pmask = 0;
+        }
+    #endif
+    if (n > gs_thread_cap) n = gs_thread_cap;  /* What the data stack budget holds. */
+    if (n < 1) n = 1;
+    if (n > 1024) n = 1024;
+    return n;
+}
 
 /* Runs chunks of fork `fork` until none is left to claim. */
 static void gs_par_chunks(int64_t fork) {
@@ -527,13 +650,19 @@ static DWORD WINAPI gs_par_main(LPVOID p)
 static void *gs_par_main(void *p)
 #endif
 {
-    (void)p;
+    #ifndef _WIN32
+        (void)p;
+    #endif
     /* Room for the data stacks of the bodies that need them (gs_par_block),
        which the compiler counts among a worker's. */
     gs_regions_begin(gs_workerregions > 0 ? gs_workerregions : 1);
     gs_native_stack_init();
     gs_in_par = 1;
     gs_par_pooled = 1;
+    #ifdef _WIN32
+        /* The performance cores' mask on a hybrid CPU (gs_par_start). */
+        if (p) SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)(uintptr_t)p);
+    #endif
     int64_t seen = 0;
     while (!gs_par_load(&gs_par_quit)) {
         int64_t fork = gs_par_load(&gs_par_claim) >> 32;
@@ -542,13 +671,15 @@ static void *gs_par_main(void *p)
             gs_par_chunks(fork);
             continue;
         }
-        int spun = 0;
-        while (spun < GS_PAR_SPIN && gs_par_load(&gs_par_claim) >> 32 == seen &&
-               !gs_par_load(&gs_par_quit)) {
+        /* Spin for gs_par_spin(), reading the clock every 64 pauses (a pause
+           is 30 to 140 cycles, by the core). */
+        int64_t until = gs_par_now_ns() + gs_par_spin(), forked = 0;
+        for (int spun = 1; !forked; spun++) {
             gs_par_pause();
-            spun++;
+            forked = gs_par_load(&gs_par_claim) >> 32 != seen || gs_par_load(&gs_par_quit);
+            if (!(spun & 63) && gs_par_now_ns() >= until) break;
         }
-        if (spun < GS_PAR_SPIN) continue;
+        if (forked) continue;
         gs_mutex_lock(&gs_par_mutex);
         gs_par_add(&gs_par_sleepers, 1);
         while (gs_par_load(&gs_par_claim) >> 32 == seen && !gs_par_load(&gs_par_quit))
@@ -565,20 +696,16 @@ static void *gs_par_main(void *p)
     #endif
 }
 
-/* The pool, made at the first fork: GOOSE_THREADS threads in all, or one for
-   each CPU the process may run on. */
-static void gs_par_start(void) {
-    const char *env = getenv("GOOSE_THREADS");
-    int64_t n = env && *env ? (int64_t)strtoll(env, NULL, 10) : gs_os_threads();
-    if (n > gs_thread_cap) n = gs_thread_cap;  /* What the data stack budget holds. */
-    if (n < 1) n = 1;
-    if (n > 1024) n = 1024;
+/* The pool, made at the first fork and again when par_threads changes its
+   size: n threads in all, the forking one among them. */
+static void gs_par_start(int64_t n) {
+    gs_par_asked = n;
     gs_par_threads = 1;
     for (int64_t i = 1; i < n; i++) {
         int failed;
         gs_par_add(&gs_par_live, 1);
         #ifdef _WIN32
-            HANDLE h = CreateThread(NULL, 0, gs_par_main, NULL, 0, NULL);
+            HANDLE h = CreateThread(NULL, 0, gs_par_main, (LPVOID)(uintptr_t)gs_par_pmask, 0, NULL);
             failed = h == NULL;
             if (h) CloseHandle(h);
         #else
@@ -599,13 +726,22 @@ static void gs_par_start(void) {
     }
 }
 
+static void gs_par_stop(void);
+
 GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
     if (hi <= lo) return;
     if (hi - lo == 1 || gs_in_par || gs_contain || !gs_par_cas(&gs_par_busy, 0, 1)) {
         f(env, lo, hi);
         return;
     }
-    if (!gs_par_threads) gs_par_start();
+    if (!gs_par_threads || gs_par_load(&gs_par_want) != gs_par_wanted) {
+        /* The first fork, or the first since par_threads: a pool of the
+           size asked for. */
+        gs_par_wanted = gs_par_load(&gs_par_want);
+        int64_t n = gs_par_size();
+        if (gs_par_threads && n != gs_par_asked) gs_par_stop();
+        if (!gs_par_threads) gs_par_start(n);
+    }
     int64_t n = hi - lo, chunks = gs_par_threads == 1 ? 1 : gs_par_threads * GS_PAR_CHUNKS;
     if (chunks > n) chunks = n;
     if (chunks > 0xffff) chunks = 0xffff;
@@ -639,6 +775,26 @@ GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi) {
 
 /* Whether this is one of the pool's threads, rather than the forking one. */
 GS_API int gs_par_pool_thread(void) { return gs_par_pooled; }
+
+/* par_threads(n): the pool's size from the next fork on, the forking thread
+   among them; 0 or less is the default again. Returns the size it will be.
+   Waits for a fork that is running, whose pool gs_par_size describes. */
+GS_API int64_t gs_par_set_threads(int64_t n) {
+    gs_par_store(&gs_par_want, n > 0 ? n : 0);
+    while (!gs_par_cas(&gs_par_busy, 0, 1)) gs_par_yield();
+    int64_t got = gs_par_size();
+    gs_par_store(&gs_par_busy, 0);
+    return got;
+}
+
+/* par_spin_us(us): how long a pool thread waits for the next fork before it
+   sleeps, from its next wait on; less than 0 is the default again. Returns
+   what it is now, in microseconds. */
+GS_API int64_t gs_par_set_spin(int64_t us) {
+    if (us > 1000000) us = 1000000;
+    gs_par_store(&gs_par_spin_ns, us < 0 ? -1 : us * 1000);
+    return gs_par_spin() / 1000;
+}
 
 /* Ends the pool's threads (goose_exit). */
 static void gs_par_stop(void) {

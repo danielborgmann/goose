@@ -1047,6 +1047,11 @@ GS_API void gs_free_msg(uint8_t *msg);
 typedef void (*gs_par_fn)(void *env, int64_t lo, int64_t hi);
 GS_API void gs_par_run(gs_par_fn f, void *env, int64_t lo, int64_t hi);
 GS_API int gs_par_pool_thread(void);
+/* par_threads(n) and par_spin_us(us): the pool's size from the next fork on
+   and how long its threads wait for a fork before they sleep; each returns
+   what it now is. */
+GS_API int64_t gs_par_set_threads(int64_t n);
+GS_API int64_t gs_par_set_spin(int64_t us);
 
 /* One queue per flat element type the program uses (the compiler emits a
    gs_queue global per type, which main sets up before anything can use it).

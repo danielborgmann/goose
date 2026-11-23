@@ -204,6 +204,7 @@ string ParEffectOf(Node *n, bool direct = false) {
         case B_THREAD_SPAWN: case B_THREAD_SPAWN_CONTAINED: return "starts a thread";
         case B_THREAD_WAIT: return "waits for a thread";
         case B_QPUT: case B_QGET: case B_QPOLL: return "uses a queue";
+        case B_PAR_THREADS: case B_PAR_SPIN_US: return cat("calls ", BuiltinByKind(c->builtin).name);
         default: break;
     }
     if (c->builtin >= 0) {

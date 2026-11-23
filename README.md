@@ -125,13 +125,22 @@ elements another iteration is writing.
 
 **How it runs.**
 
-- The first `par for` starts a pool of threads: `GOOSE_THREADS` in all if that is set, else one per
-  CPU, within the program's thread cap. The thread that forks takes part too.
+- The first `par for` starts a pool of threads, within the program's thread cap, the thread that forks
+  among them: `GOOSE_THREADS` in all if that is set, else one per CPU. On a hybrid CPU under Windows
+  the default is one per CPU of the performance cores instead, and the pool's threads are kept to
+  them: a fork waits for its slowest chunk, and on an efficiency core every chunk is slow. On a
+  13900HX (16 such CPUs of 32), against all 32: a fork and join is twice as fast, and so is a loop of
+  a few thousand short iterations, while a loop of a million long ones is 1.9 times slower.
+- `par_threads(n)` sets the pool's size from the next fork on (0: the default again) and returns the
+  size it will be; a size beyond the performance cores' is not held to them. `hardware_threads()` is
+  every CPU. Time a few sizes on the loops that matter: past a point, more threads make a loop
+  slower.
 - A loop is cut into 4 chunks per thread, which the threads claim one at a time, so uneven iterations
   even out. The loop ends when every chunk is done.
-- Between loops the pool threads spin briefly (4096 pause instructions), then sleep on a condition
-  variable: a program that forks in a tight loop does not pay a wake-up each time, and an idle one does
-  not burn a core.
+- Between loops the pool threads spin for 200 microseconds, then sleep on a condition variable: a
+  program that forks in a tight loop does not pay a wake-up each time, and an idle one does not burn a
+  core. A program with longer serial work between its forks can spin longer, with `par_spin_us(us)`
+  (or `GOOSE_PAR_SPIN_US`), at the cost of a core per pool thread for that long after each fork.
 - A body with growable locals, or one calling functions that have them, runs on the pool thread's own
   data stacks, which are emptied after each chunk.
 - These run as plain loops, in order, on the thread that reaches them: a `par for` inside another's

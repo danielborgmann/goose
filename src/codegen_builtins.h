@@ -132,6 +132,15 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
             return { tv };
         }
         case B_HARDWARE_THREADS: return { "gs_hardware_threads()" };
+        // Emitted here, not returned as text: a discarded result would drop
+        // the setting.
+        case B_PAR_THREADS: case B_PAR_SPIN_US: {
+            usesthreads = true;
+            auto t = T();
+            auto fn = c->builtin == B_PAR_THREADS ? "gs_par_set_threads" : "gs_par_set_spin";
+            L("int64_t ", t, " = ", fn, "(", GenX(an[0]), ");");
+            return { t };
+        }
         case B_RACY: return { EmitRacyMake(c, an[0]) };
         case B_FILE: {
             // The last path segment, not the path FileRef stores for aborts.
