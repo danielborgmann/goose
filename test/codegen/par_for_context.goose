@@ -7,6 +7,8 @@ var g_tab: i64[>..] = [];
 struct GH { a: i64[>..]& }
 var g_store: i64[>..] = [];
 var g_h = GH { a: g_store };
+// A global passed to a std helper whose slice parameter is not const: it only reads it.
+var g_word: u8[>..] = [];
 fn touch(p: P&, i: i64) -> i64 {
     p.sc.n += p.tab[i % p.tab.len];
     if (p.sc.n > 3) { p.sc.bail = true; }
@@ -29,6 +31,11 @@ fn main() {
         flags[i] = lsc.bail;
     }
     print(out, flags);
+    for c in "mid" { g_word.push(c); }
+    var cmp: i64[>..] = [];
+    cmp.resize(3, 0);
+    par for i in 0..3 { cmp[i] = compare(g_word, ["abc", "mid", "zed"][i]); }
+    print(cmp);
     var lsc = Sc {};
     var lb: i64[>..] = [];
     var px = P { tab: g_tab, sc: lsc, buf: lb };

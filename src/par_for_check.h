@@ -215,12 +215,16 @@ string ParEffectOf(Node *n, bool direct = false) {
     auto sp = c->spec;
     if (sp && sp->sf->isextern)
         return ParPureExtern(sp) ? string() : cat("calls the extern fn ", sp->sf->qname);
-    if (sp) {
+    // A global passed to a writable view parameter: the checker refuses it
+    // only where the callee writes it, in the callee's read-only
+    // instantiation (ParReadOnlyRoot). The survey, without those rules,
+    // names each such call as one that may write.
+    if (sp && parall) {
         auto an = c->ValueArgNodes();  // A UFCS call's receiver included.
         for (size_t i = 0; i < an.size() && i < sp->argtypes.size(); i++) {
             auto g = ParRootVar(an[i]);
             if (g && g->isglobal && ParWritableView(sp->argtypes[i]))
-                return cat("passes the global ", g->name, " to be written");
+                return cat("passes the global ", g->name, " to a parameter it may write");
         }
     }
     if (direct) return {};
