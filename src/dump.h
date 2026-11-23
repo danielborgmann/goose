@@ -62,8 +62,8 @@ inline void TypeExpr::Dump(string &s, size_t limit) const {
     if (cq) s += "const ";
     auto SubDump = [&](const TypeExpr *inner) {
         // An index type takes no postfix of its own: `(u32 in a)[>..]`.
-        auto parens = inner->kind == TY_FN || inner->cq || inner->ix ||
-                      (cq && chainhasrs(inner));
+        auto parens = inner->kind == TY_FN || inner->kind == TY_RACY || inner->cq ||
+                      inner->ix || (cq && chainhasrs(inner));
         if (parens) s += "(";
         inner->Dump(s, limit);
         if (parens) s += ")";
@@ -159,6 +159,7 @@ inline void TypeExpr::Dump(string &s, size_t limit) const {
             s += var->name;
             break;
         case TY_VOID: s += "void"; break;
+        case TY_RACY: s += "racy "; sub->Dump(s, limit); break;
     }
 }
 

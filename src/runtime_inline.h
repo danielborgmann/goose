@@ -1024,6 +1024,69 @@ GS_API void gs_release_regions(void);
 GS_API void gs_rt_stop(void);
 
 )GSRT"
+R"GSRT(/* Racy views, in the programs that use them (codegen defines GS_RACY). */
+#if defined(GS_RACY) || defined(GS_RUNTIME_OBJECT)
+/* A racy view (FastGoose, tools/racy_views.md): a worker's read-only view of
+   one of main's resizable arrays, read while main keeps writing it. Nothing
+   moves (§1.3), so the base main had when the view was made stays the
+   array's, and only the length races; every read is one volatile load, so
+   what the worker checks is what it uses, and no read leaves the region the
+   base lies in, whatever length it sees (max, from main's registry). A
+   value read may be stale or torn: memory safety never depends on it. */
+typedef struct {
+    const uint8_t *base;
+    const int64_t *len;
+    int64_t max;
+} gs_racy;
+GS_API gs_racy gs_racy_make(const uint8_t *base, const int64_t *len, int64_t esize);
+
+)GSRT"
+R"GSRT(/* The length a read checks against: what main last stored, at most max. */
+static inline int64_t gs_racy_len(gs_racy v) {
+    uint64_t n = (uint64_t)*(const volatile int64_t *)v.len;
+    return n < (uint64_t)v.max ? (int64_t)n : v.max;
+}
+
+)GSRT"
+R"GSRT(/* n bytes of main's memory at src, each loaded once (the words unaligned:
+   aggregates are packed). */
+#if defined(_MSC_VER) && !defined(__clang__)
+#define GS_RACY_WORD(T, p) (*(const volatile T __unaligned *)(p))
+typedef uint64_t gs_racy_w8;
+typedef uint32_t gs_racy_w4;
+typedef uint16_t gs_racy_w2;
+#elif defined(__GNUC__) || defined(__clang__)
+#define GS_RACY_WORD(T, p) (*(const volatile T *)(p))
+typedef uint64_t gs_racy_w8 __attribute__((aligned(1), may_alias));
+typedef uint32_t gs_racy_w4 __attribute__((aligned(1), may_alias));
+typedef uint16_t gs_racy_w2 __attribute__((aligned(1), may_alias));
+#else
+#define GS_RACY_WORD(T, p) (*(const volatile T *)(p))
+typedef uint64_t gs_racy_w8;
+typedef uint32_t gs_racy_w4;
+typedef uint16_t gs_racy_w2;
+#endif
+static inline void gs_racy_copy(void *dst, const uint8_t *src, size_t n) {
+    uint8_t *d = (uint8_t *)dst;
+    for (; n >= 8; n -= 8, src += 8, d += 8) {
+        uint64_t w = GS_RACY_WORD(gs_racy_w8, src);
+        memcpy(d, &w, 8);
+    }
+    if (n >= 4) {
+        uint32_t w = GS_RACY_WORD(gs_racy_w4, src);
+        memcpy(d, &w, 4);
+        n -= 4, src += 4, d += 4;
+    }
+    if (n >= 2) {
+        uint16_t w = GS_RACY_WORD(gs_racy_w2, src);
+        memcpy(d, &w, 2);
+        n -= 2, src += 2, d += 2;
+    }
+    if (n) *d = *(const volatile uint8_t *)src;
+}
+#endif
+
+)GSRT"
 R"GSRT(/* ---------------------------------------------------------------------------
    Dynamic externs (§7.10): the shared libraries the program's extern blocks
    name, and the functions it calls through them, bound by name as the
@@ -1656,6 +1719,13 @@ static GS_TLS volatile long gs_nregions;
 /* The registry's size: the thread program's region count, as the compiler
    worked it out, so a reservation past it is a compiler bug. */
 static GS_TLS long gs_regions_cap;
+/* Main's registry, for racy views (gs_racy_make): the worker that reads
+   main's memory through one meets its faults in main's regions, on Windows a
+   page main reserved but has not committed, or one gs_trim_memory gave
+   back. The registry never moves and an entry is filled before the count
+   is raised, so a worker reads both without a lock. */
+static gs_region *gs_main_regions;
+static volatile long *gs_main_nregions;
 
 )GSRT"
 R"GSRT(/* Text without stdio, which a fault handler may not call (nor malloc):
@@ -1728,6 +1798,32 @@ R"GSRT(GS_API GS_NORETURN void gs_stack_overflow(const void *at) {
 }
 
 )GSRT"
+R"GSRT(#if defined(GS_RACY) || defined(GS_RUNTIME_OBJECT)
+/* A view of the array whose base and length lie at base and *len, of
+   elements esize bytes: no read through it leaves the region of main's that
+   base lies in. A base in none of them, as on a pool thread's stacks, gives
+   a view that reads as empty. */
+GS_API gs_racy gs_racy_make(const uint8_t *base, const int64_t *len, int64_t esize) {
+    static const int64_t none = 0;
+    /* A view made elsewhere could outlive the memory it reads: a worker's
+       stacks end with the worker. */
+    if (gs_main_regions && gs_regions != gs_main_regions)
+        gs_panic("racy(): only the main program makes racy views");
+    gs_racy v = { base, len ? len : &none, 0 };
+    long n = gs_main_regions ? *gs_main_nregions : 0;
+    for (long i = 0; i < n; i++) {
+        const gs_region *r = &gs_main_regions[i];
+        if ((uintptr_t)base - (uintptr_t)r->base < r->usable) {
+            v.max = esize > 0 ? (int64_t)((size_t)(r->base + r->usable - base) / (size_t)esize)
+                              : INT64_MAX;
+            break;
+        }
+    }
+    return v;
+}
+#endif
+
+)GSRT"
 R"GSRT(/* The calling thread program's registry, empty, as it starts. */
 static void gs_regions_begin(int64_t capacity) {
     gs_regions_cap = (long)capacity;
@@ -1788,6 +1884,21 @@ R"GSRT(static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
     if (code != STATUS_ACCESS_VIOLATION)
         return EXCEPTION_CONTINUE_SEARCH;
     uint8_t *hit = (uint8_t *)ep->ExceptionRecord->ExceptionInformation[1];
+    /* A racy view's read of a page of main's that is not committed: commit
+       it (it reads as zeros) and resume. Main's committed mark is main's
+       own to move, so gs_trim_memory may leave such a page committed. */
+    if (gs_main_regions && gs_regions != gs_main_regions) {
+        long n = *gs_main_nregions;
+        for (long i = 0; i < n; i++) {
+            gs_region *r = &gs_main_regions[i];
+            if ((uintptr_t)hit - (uintptr_t)r->base < r->usable) {
+                uint8_t *page = (uint8_t *)((size_t)hit & ~(gs_page_size - 1));
+                if (VirtualAlloc(page, gs_page_size, MEM_COMMIT, PAGE_READWRITE))
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                break;
+            }
+        }
+    }
     for (long i = 0; i < gs_nregions; i++) {
         gs_region *r = &gs_regions[i];
         if ((uintptr_t)hit - (uintptr_t)r->base < r->size) {
@@ -3075,6 +3186,8 @@ R"GSRT(GS_API void gs_rt_start(int argc, char **argv, uint64_t reserve, uint64_t
     #endif
     gs_regions_init();
     gs_regions_begin(mainregions);
+    gs_main_regions = gs_regions;
+    gs_main_nregions = &gs_nregions;
     gs_native_stack_init();
     gs_scan_init();
 }
@@ -3085,6 +3198,8 @@ R"GSRT(/* The inverse, on main's thread: its regions and registry, then the faul
    thread programs' part; the JIT host calls this directly, since a program
    it runs may return from main with workers still running (jit_runtime.c). */
 static void gs_rt_release(void) {
+    gs_main_regions = NULL;
+    gs_main_nregions = NULL;
     gs_release_regions();
     gs_fault_uninstall();
     gs_argc = 0;

@@ -780,6 +780,7 @@ inline CodeGen::Loc CodeGen::GenLoc(Node *n) {
     if (auto d = Is<Dot>(n); d && d->IsField()) {
         auto lv = GenLoc(d->obj);
         if (lv.t->kind == TY_REF) DerefLoc(lv);
+        if (lv.t->kind == TY_RACY) return RacyFieldLoc(lv, d);
         auto ml = MemberLoc(lv, d);
         if (!fieldviews.empty()) UseFieldView(d, ml);
         return ml;
@@ -787,6 +788,7 @@ inline CodeGen::Loc CodeGen::GenLoc(Node *n) {
     if (auto ix = Is<Index>(n)) {
         auto lv = GenLoc(ix->obj);
         if (lv.t->kind == TY_REF) DerefLoc(lv);
+        if (lv.t->kind == TY_RACY) return RacyIndexLoc(lv, ix);
         return IndexLoc(lv, ix->idx, ix->line, ix->nobc);
     }
     // `&path` addressed as a location is the path itself: going through a

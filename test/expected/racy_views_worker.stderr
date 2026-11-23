@@ -1,0 +1,1 @@
+goose runtime error: racy(): only the main program makes racy views

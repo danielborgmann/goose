@@ -281,6 +281,7 @@ inline string Dot::CgX(CodeGen &cg) {
     if (member >= 0) {   // .len / .cap property.
         auto lv = cg.GenLoc(obj);
         if (lv.t->kind == TY_REF) cg.DerefLoc(lv);
+        if (lv.t->kind == TY_RACY) return cat("gs_racy_len(", lv.s, ")");
         if (lv.t->kind == TY_ARRAY && member == B_CAP) {
             assert(lv.t->arr->akind == A_LIMITED);
             return cg.LimitedCap(lv);

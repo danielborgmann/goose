@@ -328,7 +328,7 @@ inline SizeClass TypeCheck::ClassOf(TypeExpr *t) {
             // A varint-width relative reference is varint-encoded storage,
             // so it makes its container variable-class like any varint (§3.6).
             return t->ref->lenstorage == IS_VARINT ? SC_VARIABLE : SC_FIXED;
-        case TY_FLT: case TY_BOOL: case TY_SLICE: return SC_FIXED;
+        case TY_FLT: case TY_BOOL: case TY_SLICE: case TY_RACY: return SC_FIXED;
         case TY_STRUCT: {
             auto inst = GetStructInst(t);
             // Still being validated = the struct (transitively) contains
@@ -444,8 +444,9 @@ inline bool TypeCheck::ImageSafe(TypeExpr *t, string &why) {
         return false;
     }
     switch (t->kind) {
-        case TY_SLICE:
-            why = cat(TypeStr(t), " is a slice, which is an address");
+        case TY_SLICE: case TY_RACY:
+            why = cat(TypeStr(t), t->kind == TY_RACY ? " is a racy view" : " is a slice",
+                      ", which is an address");
             return false;
         case TY_REF:
             if (t->ref->lenstorage < 0) {
@@ -519,6 +520,9 @@ inline bool TypeCheck::HasDefault(TypeExpr *t, string &why) {
             }
             return true;
         case TY_FLT: case TY_BOOL: case TY_SLICE: return true;
+        case TY_RACY:
+            why = cat(TypeStr(t), " has no default: racy() makes one");
+            return false;
         case TY_REF:
             if (t->ref->optional) return true;
             why = cat(TypeStr(t), " is a non-optional reference");
@@ -719,6 +723,9 @@ inline void TypeCheck::ValidateType(TypeExpr *t, Line l, int pos) {
             }
             break;
         }
+        case TY_RACY:
+            ValidateRacy(t, l, pos);
+            return;
         case TY_SLICE: case TY_REF:
             if (typesbuilding) laterpointees.push_back({ t, l, typechain });
             else ValidatePointee(t, l);

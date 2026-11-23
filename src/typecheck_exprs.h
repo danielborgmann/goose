@@ -65,6 +65,13 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
         auto lv = LValueBase(d->obj);
         auto base = lv.type;
         DerefLValue(lv, d->obj);
+        if (lv.type->kind == TY_RACY) {
+            if (lv.type->sub->kind != TY_STRUCT)
+                Error(d, cat(TypeStr(lv.type), " has no field ", d->name));
+            auto r = RacyField(d, lv.type);
+            RecordVal(n, ContainerRead(r));
+            return r;
+        }
         CheckAccessorOwner(d, d->accessorowner, lv.type);
         ResolveMemberLValue(lv, d);
         if (lv.intemp) NoRelRefTempRead(d->obj, base, lv.type);
@@ -75,6 +82,13 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
     if (auto ix = Is<Index>(n)) {
         auto lv = LValueBase(ix->obj);
         DerefLValue(lv, ix->obj);
+        if (lv.type->kind == TY_RACY) {
+            if (lv.type->sub->kind != TY_SLICE)
+                Error(n, cat("cannot index a value of type ", TypeStr(lv.type)));
+            auto r = RacyIndex(ix, lv);
+            RecordVal(n, ContainerRead(r));
+            return r;
+        }
         SliceProvenance(lv, ix->obj);
         TypeExpr *elem;
         if (lv.type->kind == TY_SLICE) {
@@ -113,6 +127,7 @@ inline TypeCheck::LVal TypeCheck::CheckLValue(Node *n) {
 inline TypeCheck::LVal TypeCheck::LValueBase(Node *n, bool cmpview) {
     DestScope ds(*this, Dest {});
     if (Is<Ident>(n) || Is<Dot>(n) || Is<Index>(n)) return CheckLValue(n);
+    RacyReadScope off(*this, false);
     auto v = CheckV(n, nullptr);
     NoUntypedEmptyArray(v, n, "an index, slice or field of it");
     if (!cmpview) NoTemporaryLiteral(n, v.type);

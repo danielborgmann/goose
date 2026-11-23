@@ -978,6 +978,15 @@ struct Parser {
         // Foo&` a reference to a read-only Foo, `const (u8[:])&` a reference
         // to a read-only slice value. Where no reference or slice follows,
         // the value's contents are read-only: `const i64[3]`.
+        // `racy T[:]` / `racy S` (FastGoose, tools/racy_views.md): a
+        // contextual word, so only where a type follows it; a type named
+        // `racy` is followed by none.
+        if (lex.tok == T_IDENT && lex.attr == "racy" &&
+            (lex.PeekTok() == T_IDENT || IsPrimTypeToken(lex.PeekTok()))) {
+            auto line = CurLine();
+            lex.Next();
+            return ast.RacyOf(ParseType(), line);
+        }
         auto constq = IsNext(T_CONST);
         auto t = ParseTypePrimary();
         auto qualify = [&](TypeExpr *n) {

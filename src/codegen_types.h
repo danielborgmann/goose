@@ -29,7 +29,7 @@ inline bool CodeGen::TEq(TypeExpr *a, TypeExpr *b) {
                 default:        return true;
             }
         }
-        case TY_SLICE: return TEq(a->sub, b->sub);
+        case TY_SLICE: case TY_RACY: return TEq(a->sub, b->sub);
         case TY_REF:
             return TEq(a->ref->sub, b->ref->sub) && a->ref->optional == b->ref->optional &&
                    a->ref->lenstorage == b->ref->lenstorage;
@@ -308,6 +308,7 @@ inline int64_t CodeGen::FixedSize(TypeExpr *t) {
             }
             return IsResz(t->ref->sub) ? 16 : 8;
         case TY_SLICE: return 16;
+        case TY_RACY: return RacySize(t);
         case TY_STRUCT: {
             // An empty struct takes the one byte C gives it.
             auto sz = StructLayout(SI(t)).size;
@@ -488,6 +489,7 @@ inline string CodeGen::RawMangle(TypeExpr *t) {
             }
         }
         case TY_SLICE: return cat("sl_", Mangle(t->sub));
+        case TY_RACY: return cat("ry_", Mangle(t->sub));
         case TY_REF: {
             auto &r = *t->ref;
             string s = r.optional ? "o" : "r";
@@ -528,6 +530,7 @@ inline string CodeGen::CT(TypeExpr *t, bool unaligned) {
                                                    : (unaligned ? "gs_f64" : "double");
         case TY_BOOL: return "uint8_t";
         case TY_VOID: return "void";
+        case TY_RACY: return RacyCT(t);
         case TY_REF: {
             auto &r = *t->ref;
             if (r.lenstorage >= 0) {

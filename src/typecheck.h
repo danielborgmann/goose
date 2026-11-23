@@ -597,7 +597,7 @@ struct TypeCheck {
                 for (auto a : t->enu->args) if (NamesGeneric(a, name)) return true;
                 return false;
             case TY_ARRAY:   return NamesGeneric(t->arr->sub, name);
-            case TY_SLICE:   return NamesGeneric(t->sub, name);
+            case TY_SLICE: case TY_RACY: return NamesGeneric(t->sub, name);
             case TY_REF:     return NamesGeneric(t->ref->sub, name);
             case TY_VARIANT: return NamesGeneric(t->var->adt, name);
             default:         return false;
@@ -958,7 +958,7 @@ struct TypeCheck {
                                    t->arr->akind == A_LIMITED ? "array capacity" : "array size", f);
                 SizeNames(t->arr->sub, f);
                 return;
-            case TY_SLICE: SizeNames(t->sub, f); return;
+            case TY_SLICE: case TY_RACY: SizeNames(t->sub, f); return;
             case TY_REF: SizeNames(t->ref->sub, f); return;
             case TY_STRUCT: for (auto a : t->struc->args) SizeNames(a, f); return;
             case TY_ENUM: for (auto a : t->enu->args) SizeNames(a, f); return;
@@ -1002,7 +1002,7 @@ struct TypeCheck {
                     default: return true;
                 }
             }
-            case TY_SLICE: return TypeEq(a->sub, b->sub);
+            case TY_SLICE: case TY_RACY: return TypeEq(a->sub, b->sub);
             case TY_REF:
                 // The pool is part of a relative reference's identity: offsets
                 // measured from different bases are different encodings (§3.9).
@@ -1132,6 +1132,10 @@ struct TypeCheck {
                 auto n = ast.SliceOf(sub, t->line);
                 n->cq = t->cq;
                 return n;
+            }
+            case TY_RACY: {
+                auto sub = Subst(t->sub);
+                return sub == t->sub ? t : ast.RacyOf(sub, t->line);
             }
             case TY_REF: {
                 auto sub = Subst(t->ref->sub);
@@ -1969,7 +1973,7 @@ struct TypeCheck {
             case TY_STRUCT: return t->struc->st->unknown || any(t->struc->args);
             case TY_ENUM: return any(t->enu->args);
             case TY_ARRAY: return MentionsUnknown(t->arr->sub);
-            case TY_SLICE: return MentionsUnknown(t->sub);
+            case TY_SLICE: case TY_RACY: return MentionsUnknown(t->sub);
             case TY_REF: return MentionsUnknown(t->ref->sub);
             case TY_VARIANT: return MentionsUnknown(t->var->adt);
             case TY_FN: return any(t->fn->args) || any(t->fn->rets);
@@ -3173,6 +3177,7 @@ struct TypeCheck {
     // the code that root reached after it; the rest is checked as if the
     // root had completed.
     #include "par_for_check.h"
+    #include "racy_check.h"
 
     void CheckRoots() {
         for (auto g : ast.globals) {

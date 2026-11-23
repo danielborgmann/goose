@@ -1594,6 +1594,7 @@ struct CodeGen {
     string ExportHeader();
 
     #include "par_for.h"
+    #include "racy.h"
 
     // Extern-support C and user headers are inputs to this emission, not
     // process state that the driver must install before constructing us.
@@ -1632,6 +1633,7 @@ struct CodeGen {
         if (!library) EmitMain();
         if (usesthreads) predefs = "#define GS_NEED_THREADS 1\n";
         if (usespar) predefs += "#define GS_PAR 1\n";
+        if (usesracy) predefs += "#define GS_RACY 1\n";
         // The instance block: with workers each thread reaches its own
         // through gs_gl; without them there is only main's.
         Append(data, "typedef struct {\n", gblock.empty() ? "    uint8_t gs_none;\n" : gblock,

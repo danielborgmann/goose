@@ -192,6 +192,7 @@ inline Val TypeCheck::CheckBuiltin(Call *c, const BuiltinDef &d, vector<Node *> 
             v.writable = false;
             return v;
         }
+        case B_RACY: return CheckRacyBuiltin(c, args[0]);
         case B_COPY: {
             // copy(x): a fresh value from stored one (§4.1), for the
             // destinations that never copy implicitly.

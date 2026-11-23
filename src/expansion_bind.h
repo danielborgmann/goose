@@ -37,7 +37,7 @@ struct ExpansionBinder {
                 break;
             }
             case TY_ARRAY: Type(t->arr->sub); Walk(t->arr->sizeexpr); break;
-            case TY_SLICE: Type(t->sub); break;
+            case TY_SLICE: case TY_RACY: Type(t->sub); break;
             case TY_REF: Type(t->ref->sub); break;
             case TY_VARIANT: Type(t->var->adt); break;
             case TY_FN:

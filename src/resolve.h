@@ -114,7 +114,7 @@ inline void ResolveTypeNames(Ast &ast) {
                 }
                 case TY_ARRAY: unknownin(t->arr->sub, generics); break;
                 case TY_REF: unknownin(t->ref->sub, generics); break;
-                case TY_SLICE: unknownin(t->sub, generics); break;
+                case TY_SLICE: case TY_RACY: unknownin(t->sub, generics); break;
                 case TY_VARIANT: unknownin(t->var->adt, generics); break;
                 case TY_STRUCT: each(t->struc->args); break;
                 case TY_ENUM: each(t->enu->args); break;
@@ -159,7 +159,7 @@ inline void ResolveTypeNames(Ast &ast) {
             }
             case TY_ARRAY: checkaliases(t->arr->sub); break;
             case TY_REF: checkaliases(t->ref->sub); break;
-            case TY_SLICE: checkaliases(t->sub); break;
+            case TY_SLICE: case TY_RACY: checkaliases(t->sub); break;
             case TY_VARIANT: checkaliases(t->var->adt); break;
             case TY_STRUCT: each(t->struc->args); break;
             case TY_ENUM: each(t->enu->args); break;

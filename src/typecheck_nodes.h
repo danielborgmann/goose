@@ -474,6 +474,20 @@ inline Val Dot::Check(TypeCheck &tc, TypeExpr *) {
         ov.ClearReads();
         ov.reached = tc.LoadType(t);
     }
+    if (t->kind == TY_RACY) {
+        // A racy view: its length, or a field read through it.
+        if (t->sub->kind == TY_SLICE && name == "len") {
+            member = B_LEN;
+            Val v;
+            v.type = tc.ast.inttypes[IS_I64];
+            v.nonneg = true;
+            return v;
+        }
+        if (t->sub->kind != TY_STRUCT)
+            tc.Error(this, cat(tc.TypeStr(t), " has no field ", name));
+        TypeCheck::RacyReadScope on(tc, true);
+        return tc.ContainerRead(tc.RacyField(this, t));
+    }
     tc.CheckAccessorOwner(this, accessorowner, t);
     // Builtin properties (.len/.cap) from the table.
     if (auto bd = LookupBuiltin(name); bd && (bd->flags & BF_PROPERTY)) {
@@ -501,6 +515,7 @@ inline Val Call::Check(TypeCheck &tc, TypeExpr *expected) { return tc.CheckCall(
 
 inline Val Index::Check(TypeCheck &tc, TypeExpr *) {
     TypeCheck::DestScope ds(tc, TypeCheck::Dest {});
+    TypeCheck::RacyReadScope on(tc, true);
     return tc.ContainerRead(tc.CheckLValue(this));
 }
 

@@ -2031,6 +2031,9 @@ inline void TypeCheck::CheckFor(ForLoop *x) {
         }
         t = LoadType(t);
         RequireComplete(t, x->line);
+        if (t->kind == TY_RACY)
+            Error(x, "a racy view is read by index, not iterated: `for i in v.len { let x = "
+                     "v[i]; ... }`, each element read once (tools/racy_views.md)");
         if (IsIntT(t)) {
             x->iterkind = IK_COUNT;
             if (x->byref) Error(x, "cannot iterate an integer count by reference");

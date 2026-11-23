@@ -132,6 +132,7 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
             return { tv };
         }
         case B_HARDWARE_THREADS: return { "gs_hardware_threads()" };
+        case B_RACY: return { EmitRacyMake(c, an[0]) };
         case B_FILE: {
             // The last path segment, not the path FileRef stores for aborts.
             // A log line must not embed the directory the compiler loaded.

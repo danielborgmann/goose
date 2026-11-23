@@ -65,6 +65,8 @@ enum TypeKind {
     TY_REF,         // T& / T&<w> / T&<w in pool> (relative offset) / optional T?.
     TY_VARIANT,     // T.Name — variant type of an ADT.
     TY_VOID,        // Typecheck-created: the "type" of statements and valueless blocks.
+    TY_RACY,        // racy T[:] / racy S: a worker's view of main's memory (FastGoose,
+                    // tools/racy_views.md); sub is the viewed slice or struct type.
 };
 
 enum ArrayKind {
@@ -317,7 +319,7 @@ struct TypeExpr {
     union {                          // Active member selected by kind:
         IntStorage intstorage;       //   TY_INT
         FltStorage fltstorage;       //   TY_FLT
-        TypeExpr *sub;               //   TY_SLICE (element type)
+        TypeExpr *sub;               //   TY_SLICE (element type), TY_RACY (viewed type)
         TypeStruct *struc;           //   TY_STRUCT
         TypeEnum *enu;               //   TY_ENUM
         TypeName *named;             //   TY_UNRESOLVED, TY_GENERIC
@@ -2783,6 +2785,11 @@ struct Ast {
     TypeExpr *SliceOf(TypeExpr *elem, Line line) {
         auto t = NewType(TY_SLICE, line);
         t->sub = elem;
+        return t;
+    }
+    TypeExpr *RacyOf(TypeExpr *viewed, Line line) {
+        auto t = NewType(TY_RACY, line);
+        t->sub = viewed;
         return t;
     }
     // A plain or optional reference; a relative one sets its width and
