@@ -133,6 +133,17 @@ use queues, write a global, or call an extern outside the standard library's pur
 are not ordered by iteration the way a plain `for`'s are. A body cannot `return` or `break` out of
 the loop; `continue` ends one iteration.
 
+**Your own externs.** Declare a C function `extern pure fn` to let a body call it:
+
+```goose
+extern pure fn text_width(font: i64, size: f32, text: const u8[:]) -> f32 = "gui_text_width";
+```
+
+`pure` is your promise, which the compiler cannot check: the C function may be called from many
+threads at once, and its only effects are on what it is passed. Its parameters follow the standard
+library's rule above (scalars, `const` views, numbers it writes back). A cache inside it must be
+thread-safe. Code that uses `pure` builds only with this compiler.
+
 **Every refusal at once.** A check stops a loop at its first refusal. When porting much code to
 `par for`, set `GOOSE_PAR_ALL=1` and one check lists them all: every direct write to a variable of
 the function around the loop, and every effect in the body or in any function it calls (the latter

@@ -152,13 +152,17 @@ static bool ParWritableView(const TypeExpr *t) {
 // values, which are math's, binary's and std's taking nothing they could
 // write through, and os's monotonic clock, which reads a counter each thread
 // may (a reading is not ordered by iteration, as a plain for's would be).
-// A `pure` marker is for later (llm_frontier §3.4).
+// And any `extern pure fn`, whose declarer vouches for its thread safety
+// (llm_frontier §3.4's marker, on externs only); both with the parameters
+// below.
 bool ParPureExtern(const FnSpec *sp) {
-    auto fi = sp->sf->line.fileidx;
-    if (!ast.StdlibFile(fi)) return false;
-    auto stem = PathStem(ast.sources[fi].first);
-    if (stem == "os" && sp->sf->name == "clock_ns") return true;
-    if (stem != "std" && stem != "math" && stem != "binary") return false;
+    if (!sp->sf->ispure) {
+        auto fi = sp->sf->line.fileidx;
+        if (!ast.StdlibFile(fi)) return false;
+        auto stem = PathStem(ast.sources[fi].first);
+        if (stem == "os" && sp->sf->name == "clock_ns") return true;
+        if (stem != "std" && stem != "math" && stem != "binary") return false;
+    }
     // A writable parameter is an out-parameter of numbers, which the call
     // must pass storage the iteration may write, as any call must (§9.5).
     auto number = [](const TypeExpr *t) {
@@ -219,7 +223,11 @@ string ParEffectOf(Node *n, bool direct = false) {
     }
     auto sp = c->spec;
     if (sp && sp->sf->isextern)
-        return ParPureExtern(sp) ? string() : cat("calls the extern fn ", sp->sf->qname);
+        return ParPureExtern(sp) ? string()
+               : sp->sf->ispure
+                   ? cat("calls the extern pure fn ", sp->sf->qname,
+                         ", which takes a writable reference or slice of other than numbers")
+                   : cat("calls the extern fn ", sp->sf->qname, " (an extern pure fn may be called)");
     // A global passed to a writable view parameter: the checker refuses it
     // only where the callee writes it, in the callee's read-only
     // instantiation (ParReadOnlyRoot). The survey, without those rules,

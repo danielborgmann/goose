@@ -1544,6 +1544,9 @@ struct SFunction {
     bool checkfree = false;
     bool isthread = false;
     bool isextern = false;      // A C function behind a Goose signature (§7.10); no body.
+    // `extern pure fn` (FastGoose, tools/par_for.md): the declarer vouches the
+    // C function is safe to call from any par for iteration.
+    bool ispure = false;
     bool isexport = false;      // A Goose function exposed through a C ABI wrapper.
     string cname;               // Its C symbol (the Goose name unless spelled out).
     // The shared library an extern block binds it from by that symbol as

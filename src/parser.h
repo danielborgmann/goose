@@ -783,6 +783,12 @@ struct Parser {
         }
         if (checkfree && sf->isextern)
             Error("extern fn cannot be checkfree: it has no body to check");
+        // `pure`, a contextual word after `extern` (FastGoose, tools/par_for.md).
+        if (lex.tok == T_IDENT && lex.attr == "pure" && lex.PeekTok() == T_FN) {
+            if (!sf->isextern) Error("pure is for an extern fn: a Goose function's effects are checked");
+            sf->ispure = true;
+            lex.Next();
+        }
         // A nested function is part of the body it is declared in.
         sf->checkfree = checkfree || (nested && curfn && curfn->checkfree);
         if (IsNext(T_SIMD)) {

@@ -56,7 +56,9 @@ par for v in E BODY        =>  the same with a `const if` on __s's type choosing
 - **R3:** a pass after checking, over the nested function's specialization and everything it calls:
   print, exit, threads and queues, a write to a global, an extern that is not pure (pure: from `std`,
   `math` or `binary`, its parameters scalars, `const` views, or writable references or slices of
-  numbers, its out-parameters; and `os::clock_ns`, a thread-safe counter read).
+  numbers, its out-parameters; and `os::clock_ns`, a thread-safe counter read), or one declared
+  `extern pure fn`, whose declarer vouches for its thread safety, with the same parameter rule. `pure`
+  is a contextual word after `extern` (or before `fn` in an extern block), and only there.
 - **Globals and references, in the checker.** A syntactic pass cannot follow a reference, so R3's
   global writes are also the checker's. A specialization checked for a call in a par for's iterations
   has `FnSpec::parreach`, part of the key (`InParContext`), and there `ParCaptured` holds for every
