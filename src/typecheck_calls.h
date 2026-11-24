@@ -2078,6 +2078,12 @@ inline void TypeCheck::ValidateCycle(FnSpec *spec, Node *callnode) {
     if (fi < 0) fi = 0;
     for (auto i = fi; i < (int)frames.size(); i++) {
         if (!frames[i].spec || !frames[i].sf || frames[i].isfunval) continue;
+        // A par for body's locals would need stacks per activation
+        // (FastGoose, tools/par_for.md).
+        if (frames[i].sf->par)
+            Error(callnode, "a par for body cannot call back into the recursive cycle it is in: "
+                            "its iterations' growable locals would need data stacks per activation "
+                            "(a par for outside the cycle may enter it)");
         for (auto &p : frames[i].sf->params)
             if (!p.type)
                 Error(callnode, cat("function ", frames[i].sf->name, " is in a recursive "
