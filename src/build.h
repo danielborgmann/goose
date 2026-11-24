@@ -56,16 +56,21 @@ struct Builder {
     FILE *msgs;
 
     // The compile flags of both styles: optimization, or debug information
-    // and none of it. Defines go into the C itself (main.cpp), never here.
+    // and none of it, then GOOSE_CFLAGS. Defines go into the C itself
+    // (main.cpp), never here.
     vector<string> CFlags() const {
+        vector<string> f;
         if (tc.style == "msvc") {
-            vector<string> f = { "/nologo" };
+            f.push_back("/nologo");
             if (opts.debug) f.push_back("/Od"), f.push_back("/Zi");
             else f.push_back("/O2");
-            return f;
+        } else if (opts.debug) {
+            f = { "-O0", "-g" };
+        } else {
+            f = { "-O2" };
         }
-        if (opts.debug) return { "-O0", "-g" };
-        return { "-O2" };
+        for (auto &x : ExtraCFlags()) f.push_back(x);
+        return f;
     }
 
     // The system libraries a program links beyond the C library, in the cc

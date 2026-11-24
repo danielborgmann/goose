@@ -294,6 +294,26 @@ inline string NinjaPath() {
 
 // --- the C toolchain -----------------------------------------------------------
 
+// GOOSE_CFLAGS: more flags for every C compile, after the optimization ones
+// (-march=x86-64-v3, say), split at whitespace.
+inline string ExtraCFlagsText() {
+    auto e = getenv("GOOSE_CFLAGS");
+    return e ? string(e) : string();
+}
+inline vector<string> ExtraCFlags() {
+    vector<string> r;
+    string cur;
+    for (char ch : ExtraCFlagsText()) {
+        if (isspace((unsigned char)ch)) {
+            if (!cur.empty()) r.push_back(cur), cur.clear();
+        } else {
+            cur += ch;
+        }
+    }
+    if (!cur.empty()) r.push_back(cur);
+    return r;
+}
+
 // Fills in what the driver at `cc` says about itself: its version, the
 // description, the id.
 inline Toolchain DescribeToolchain(const string &name, const string &style, const string &cc,
@@ -312,7 +332,11 @@ inline Toolchain DescribeToolchain(const string &name, const string &style, cons
         t.version = ToolVersion(cc, { "--version" });
         t.desc = cat(name, " ", t.version);
     }
-    t.id = cat(name, "-", t.version, "-", Hex8(cat(cc, "|", style)));
+    // GOOSE_CFLAGS is part of the id, so that the objects of other flags are
+    // kept apart; unset, the id is what it was.
+    auto extra = ExtraCFlagsText();
+    t.id = cat(name, "-", t.version, "-",
+               Hex8(extra.empty() ? cat(cc, "|", style) : cat(cc, "|", style, "|", extra)));
     return t;
 }
 

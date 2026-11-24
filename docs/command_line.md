@@ -154,7 +154,10 @@ second or two, so `goose` keeps the result in `GOOSE_HOME/toolchain` and
 `goose toolchain --refresh` sets it up again.
 
 The C is always compiled optimized (`/O2` or `-O2`), whatever `-O` level
-the Goose compiler used, except under `--debug`. The options of a build,
+the Goose compiler used, except under `--debug`. `GOOSE_CFLAGS` adds flags
+to every C compile, after those (`GOOSE_CFLAGS=-march=x86-64-v3`); objects
+built with other flags are kept apart, so changing it compiles everything
+again once. The options of a build,
 beyond those in [§5](#5-options-for-run-build-and-check):
 
 | Option | What it does |

@@ -245,6 +245,7 @@ The design notes are [tools/par_for.md](tools/par_for.md) and [tools/racy_views.
 |---|---|
 | `chunk`, `chunk_at` | In `std`: `xs.chunk(k, n)` is the k-th of n contiguous runs of a slice, `xs.chunk_at(bounds, k)` the run between two offsets. |
 | `--no-unreached` | Check only the functions the program reaches. By default an uncalled function is checked on its own, which can specialize again much of what it calls; this skips that, so its errors go unreported. The generated code is the same. |
+| `GOOSE_CFLAGS` | Flags added to every C compile, after the optimization ones, such as `-march=x86-64-v3`. Objects built with other flags are kept apart, so a change compiles everything again once. |
 | `--stats` | Also prints how long each phase took (parse, check, optimize, bounds checks, codegen, emit, C compile, link). |
 | `tools/sampler` | A small Windows sampling profiler for compiler runs (exclusive and inclusive time, callers, time within a function). |
 | `tools/bench.ps1` | Times several compiler builds against each other, each in a block of runs. |
