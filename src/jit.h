@@ -42,9 +42,12 @@ inline void JitDiag(void *opaque, const char *msg) {
 // Compiles `csrc` into this process's memory, ready for RunJit. `symbols`
 // holds the C functions of the packages' native parts the program reaches, by
 // name (native.h, builtin.h): from the tables compiled in with builtin
-// packages, or loaded from the libraries built for the others.
+// packages, or loaded from the libraries built for the others. `incdir`, if
+// set, is where the C is also written, which its --include headers are
+// written relative to.
 inline TCCState *CompileJit(const string &csrc, const string &libpath,
-                            const vector<pair<string, const void *>> &symbols) {
+                            const vector<pair<string, const void *>> &symbols,
+                            const string &incdir = "") {
     string diags;
     auto s = tcc_new();
     if (!s) throw CompileError { "libtcc: out of memory" };
@@ -55,6 +58,7 @@ inline TCCState *CompileJit(const string &csrc, const string &libpath,
     tcc_set_options(s, "-nostdinc -nostdlib -Wl,-nostdlib");
     tcc_add_sysinclude_path(s, cat(libpath, "/goose/include").c_str());
     tcc_add_sysinclude_path(s, cat(libpath, "/include").c_str());
+    if (!incdir.empty()) tcc_add_include_path(s, incdir.c_str());
     auto fail = [&](const char *what) {
         auto msg = cat("libtcc: ", what, "\n", diags);
         tcc_delete(s);

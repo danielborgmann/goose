@@ -1783,8 +1783,9 @@ int Main(int argc, char **argv) {
         // goes: the generated file then compiles wherever the tree sits,
         // instead of carrying this machine's absolute paths. A name that is
         // not a file from here is one the C compiler is meant to find on its
-        // own include path, and is left alone. A JIT run has no file to be
-        // relative to and resolves them from the working directory.
+        // own include path, and is left alone. A JIT run that writes no file
+        // resolves them from the working directory; one that does searches
+        // that file's directory (CompileJit).
         if (!outfile.empty())
             for (auto &inc : includes)
                 if (FileExists(inc)) inc = RelativeTo(inc, DirOf(outfile));
@@ -1977,7 +1978,8 @@ int Main(int argc, char **argv) {
             // thread has only `ulimit -s`.
             TCCState *jit = nullptr;
             RunOnCompilerStack([&]() -> int {
-                jit = CompileJit(program, JitLibPath(DirOf(exe)), symbols);
+                jit = CompileJit(program, JitLibPath(DirOf(exe)), symbols,
+                                 outfile.empty() ? string() : DirOf(outfile));
                 return 0;
             });
             // The program shares this process, so its exit code becomes ours
