@@ -198,7 +198,8 @@ easy to replace a complete analysis.
 4. **Positions are byte offsets with lengths.** Nodes and declarations get
    a start column and an end; the server converts to line and UTF-16
    column at the protocol boundary, since VS Code's client asks for
-   UTF-16. The compiler never deals in the protocol's units.
+   UTF-16 (a client offering UTF-8 gets byte columns, §10). The compiler
+   never deals in the protocol's units.
 
 5. **Diagnostics are data first, text second.** A `CompileError` carries a
    structured diagnostic (file, range, message, severity, the chain as
@@ -288,6 +289,7 @@ show is affordable (parsing is a tenth of a check).
 **Positions.** The server holds the text of every file of every analysis
 (the `Ast` does already). A protocol position becomes a byte offset by
 walking the line, counting UTF-16 units; the reverse walk makes ranges.
+For a client that negotiated UTF-8 the column already is the byte.
 `LoadSource` strips a byte-order mark, and the server strips it from an
 overlay text too, so offsets agree with the editor's, which never shows
 the mark.
@@ -413,7 +415,7 @@ tree, and its `Format` in `format.h` is pure, which the server calls).
 | Feature | Answered from | Needs |
 |---|---|---|
 | Diagnostics on change | the analysis of each root the file belongs to | B, C, E, F; D1 and D2 for more than the first error |
-| Hover | the clone at the position: `exprtype`, a `VarDef`'s type, `DumpInstance` of a `Call::spec`, a declaration's signature and doc | A, H |
+| Hover | the clone at the position: `exprtype`, a `VarDef`'s type, `DumpInstance` of a `Call::spec`, a declaration's signature and doc; for builtins, `builtindocs`' signature, concrete call types, and doc (or `builtin .name: i64` for properties) | A, H |
 | Go to definition | `Ident::vdef` (local or global `VarDef`), `fnref` or `Call::spec->sf`, `Dot::fieldidx` into the `SStruct`, `variantconst`, a `TypeExpr`'s `SStruct`/`SEnum`/`SAlias`, an `Import`'s file | A |
 | References, rename | every clone's `Ident`, `Dot`, `Call`, `TypeName` resolving to the declaration, reduced to source nodes by `Origin()`; rename edits the leaf name of each reference and of the declaration | A; across the roots that reach the file |
 | Call hierarchy | the function named at the position, found as for go to definition; its incoming calls are the references that are the callee of a call, grouped by the function declared around each; its outgoing calls are the callees in its body (those in its nested functions are left to them), grouped by the function each resolves to | A (ends, to find the function around a call) |
@@ -421,9 +423,9 @@ tree, and its `Format` in `format.h` is pure, which the server calls).
 | Workspace symbols | the declaration tables of every root | |
 | Completion of names | the parse tree: the bindings of the blocks enclosing the position (`VarDecl`, parameters, `for` and `match` binders, nested functions), then the namespace's globals, functions, types, the builtins table and the keywords; works in generic bodies, which have no clone | A |
 | Completion after `.` | the incomplete `Dot`'s object type from its clone: the instance's fields, the enum's variants, the functions whose first parameter accepts the type (UFCS), the builtins table's members by receiver kind (`BR_` masks); without a clone, every field and function name | D1 (the incomplete `Dot`) |
-| Signature help | the overloads of the callee's name (`Namespace::functionmap`) and the builtins table's arity, from the parse alone; the active parameter by commas | A |
-| Semantic tokens | the parse tree and the symbol tables: function, type, type parameter, variant, field, namespace, parameter, variable (`let` read-only), with no clone needed | A |
-| Inlay hints | a `let` without a type: its `VarDef::type` in the clone (the first specialization's, where they differ); parameter names at calls from `Call::spec->sf` | A |
+| Signature help | the overloads of the callee's name (`LocalFnsAt`, `Namespace::functionmap`, or `ResolveUfcs` following `CheckUfcsCall`'s order with fallback when the receiver type is unknown) and `builtindocs`' parsed forms, parameters and doc; the active parameter by commas (clamped for variadic builtins) | A |
+| Semantic tokens | the parse tree, the symbol tables, and resolved call/member annotations: function, type, type parameter, variant, field, namespace, parameter, variable (`let` read-only), and `defaultLibrary` on builtins | A |
+| Inlay hints | a `let` without a type: its `VarDef::type` in the clone (the first specialization's, where they differ); parameter names at calls from `Call::spec->sf`, and on multi-argument builtin calls (`>= 2` post-receiver written args on `BF_MEMBER`, or `>= 2` args otherwise) for non-variadic parameters from `builtindocs` (or worker params for `thread_spawn*`) | A |
 | Folding, selection ranges | node ends | A (ends) |
 | Code lens | the specializations of a generic function (`sf->specs`), "run" above `main` through the existing task | |
 | Formatting | the open document's text, not an analysis, so none is waited for: `Format` (`format.h`), and `LineChanges` for the edits, the runs of lines a diff of the text and the result finds changed; null for a document that does not parse | |
@@ -629,10 +631,11 @@ provided.
   from. The heads stay `file:line:`; the test runner and that parser both
   accept a `file:line:col:` head already (§2), so adding the column there
   is a choice of presentation, with the JSON form available either way.
-* **Position encoding.** VS Code negotiates UTF-16; the server converts.
-  Supporting `utf-8` for clients that offer it means returning a
-  `positionEncoding` in the initialize result and skipping the conversion,
-  once a client wants it.
+* **Position encoding.** Done. A client that lists `utf-8` in
+  `general.positionEncodings` (Neovim, Helix) gets `"positionEncoding":
+  "utf-8"` in the initialize result, and its columns are bytes, with no
+  conversion; any other client gets UTF-16, as VS Code asks. A UTF-8 column
+  inside a character is taken back to its start. `utf-32` is not offered.
 * **A browser extension.** Running the compiler in the extension host as
   WebAssembly would serve `vscode.dev`; the compile thread, the process
   runner and TinyCC make that a port, not a build flag. Not planned.

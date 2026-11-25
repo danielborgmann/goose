@@ -495,14 +495,16 @@ inline void CodeGen::GenBodyCopy(Block *bodyb, int si, size_t first) {
 // rest; `bind` declares an iteration's loop variables, and `step` advances
 // them. The two copies of the body share one Goose loop scope, so a break in
 // either leaves both and a divisor fixed for the loop serves both, while each
-// has its own continue label.
+// has its own continue label. Without `tail`, where a count from 0 is a
+// constant multiple of k, the blocks run every iteration and the rest is
+// left out: it would never run, and gcc warns about such a loop (#210).
 //
 // Strip-mined (stripk), the block is a loop of k iterations whose counter is
 // the value of every `i % k` the body takes. An in-order sum (sumred)
 // computes the block's k terms into a local array, then adds them to the sum
 // one after another, as the loop would have.
 inline void CodeGen::GenBlocked(ForLoop *f, int k, const string &more, const string &step,
-                                const function<void()> &bind, const string &cond) {
+                                const function<void()> &bind, const string &cond, bool tail) {
     auto lp = OpenLoop(f->body, nullptr, { f->vdef, f->idxdef }, Dst {});
     auto si = lp.si;
     cscopes[si].straight = StraightCode(f->body);
@@ -547,16 +549,18 @@ inline void CodeGen::GenBlocked(ForLoop *f, int k, const string &more, const str
         ind--;
         L("}");
     }
-    cscopes[si].saves.clear();
-    cscopes[si].defers.clear();
-    cscopes[si].usedcnt = false;
-    cscopes[si].cntlbl = Lbl();
-    L("for (; ", cond, "; ", step, ") {");
-    ind++;
-    bind();
-    GenBodyCopy(f->body, si);
-    ind--;
-    L("}");
+    if (tail) {
+        cscopes[si].saves.clear();
+        cscopes[si].defers.clear();
+        cscopes[si].usedcnt = false;
+        cscopes[si].cntlbl = Lbl();
+        L("for (; ", cond, "; ", step, ") {");
+        ind++;
+        bind();
+        GenBodyCopy(f->body, si);
+        ind--;
+        L("}");
+    }
     CloseLoop(lp);
 }
 
@@ -786,7 +790,14 @@ inline Dst CodeGen::DeclStackLocal(VarDef *d, bool forlocal) {
     }
     if (IsFrameObj(t)) {
         L(CT(t), " ", name, ";");
-        if (own) SaveBase(forlocal, stk, cat(FoTailHdr(t, name), ".base"));
+        if (own) {
+            // The watermark is set before the literal builds the fixed fields
+            // in front of the tail: one of them can leave the function
+            // (`return ... from`), whose exit restores the stack from it.
+            auto base = cat(FoTailHdr(t, name), ".base");
+            L(base, " = ", Top(stk), ";");
+            SaveBase(forlocal, stk, base);
+        }
         return Dst { DK_STACK, stk, t, name };
     }
     L("gs_rhdr ", name, " = { ", Top(stk), ", 0 };");
@@ -1143,20 +1154,26 @@ inline void CodeGen::GenFromReturn(Return *r) {
 inline void CodeGen::EnsureFromChannels(FnSpec *t) {
     if (fromemitted.count(t)) return;
     fromemitted.insert(t);
-    auto tid = fromids[t];
+    data += FromChannels(t, cat(fromids[t]));
+}
+
+// The declarations of target t's channels, its number spelled tid.
+inline string CodeGen::FromChannels(FnSpec *t, const string &tid) {
+    string decls;
     auto &rets = t->rets;
     for (size_t i = 0; i < rets.size(); i++) {
         if (IsFix(rets[i])) {
-            Append(data, "static GS_TLS ", CT(rets[i]), NeedsResultLocation(rets[i]) ? " *" : " ",
+            Append(decls, "static GS_TLS ", CT(rets[i]), NeedsResultLocation(rets[i]) ? " *" : " ",
                    "gs_lret_", tid, "_", i, ";\n");
             continue;
         }
-        Append(data, "static GS_TLS gs_stack *gs_fdst_", tid, "_", i, ";\n");
-        Append(data, "static GS_TLS uint8_t *gs_fval_", tid, "_", i, ";\n");
+        Append(decls, "static GS_TLS gs_stack *gs_fdst_", tid, "_", i, ";\n");
+        Append(decls, "static GS_TLS uint8_t *gs_fval_", tid, "_", i, ";\n");
         if (IsResz(rets[i]))
-            Append(data, "static GS_TLS ", IsFrameObj(rets[i]) ? CT(rets[i]) : string("int64_t"),
+            Append(decls, "static GS_TLS ", IsFrameObj(rets[i]) ? CT(rets[i]) : string("int64_t"),
                    " gs_lret_", tid, "_", i, ";\n");
     }
+    return decls;
 }
 
 // ------------------------------------------------------------------

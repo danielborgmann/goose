@@ -15,12 +15,15 @@ must turn the text into what `goose format` writes, change only the lines
 that change, and be none for a formatted document; a document that does
 not parse, or one not open, gets null. A second client, with two_a.goose and two_b.goose as its entry
 files, renames a function both import and finds its references and callers
-in both programs. Each server is seen out. The row of docs/testing.md on
-this file has the details."""
+in both programs. Then a client per offer of position encodings opens
+encodings.goose and checks its columns are UTF-8 bytes where it offered
+those, else UTF-16 units. Each server is seen out. The row of
+docs/testing.md on this file has the details."""
 import json
 import re
 import subprocess
 import time
+import urllib.parse
 from pathlib import Path
 
 import toolchain as tc
@@ -31,10 +34,13 @@ REFRESHED = ("codeLens", "semanticTokens", "inlayHint")
 
 
 def uri_of(path):
+    """A path's URI as the server spells one (UriOfPath in src/lsp_rpc.h):
+    the drive letter in lower case, and everything but unreserved characters
+    escaped, so a `#` or a space in the path matches its replies."""
     p = Path(path).resolve().as_posix()
     if re.match(r"^[A-Za-z]:/", p):
-        p = p[0].lower() + "%3A" + p[2:]
-    return "file:///" + p.lstrip("/")
+        p = p[0].lower() + p[1:]
+    return "file:///" + urllib.parse.quote(p.lstrip("/"), safe="/")
 
 
 class Client:
@@ -139,8 +145,227 @@ class Client:
                            f"{json.dumps(last, indent=1)[:2000]}")
 
 
+def check_builtin_docs_sync(repo):
+    """Checks src/builtins.h builtindocs against docs/reference.md and docs/goose_spec.md §12."""
+    builtins_text = (repo / "src" / "builtins.h").read_text(encoding="utf-8")
+    ref_text = (repo / "docs" / "reference.md").read_text(encoding="utf-8")
+    spec_text = (repo / "docs" / "goose_spec.md").read_text(encoding="utf-8")
+
+    m_macro = re.search(r"#define BUILTINS\s*\\\n(.*?)\n\nenum BuiltinKind", builtins_text, re.S)
+    if not m_macro:
+        raise RuntimeError("cannot find BUILTINS macro in src/builtins.h")
+    defs = {}
+    for line in m_macro.group(1).splitlines():
+        m = re.match(r'\s*F\(\s*(\w+)\s*,\s*"([^"]+)"\s*,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,\s*([^)\\]+)', line)
+        if m:
+            kind, name, flags = m.groups()
+            defs[kind] = (name, flags.strip())
+
+    m_docs = re.search(r"builtindocs\[\]\s*=\s*\{\n(.*?)\n\};", builtins_text, re.S)
+    if not m_docs:
+        raise RuntimeError("cannot find builtindocs[] in src/builtins.h")
+
+    def parse_cpp_str(raw):
+        return raw.replace('\\"', '"').replace("\\n", "\n")
+
+    def parse_sig(sig, member_recv=None):
+        sig = sig.strip().replace("…", "...")
+        rets = ""
+        if " -> " in sig:
+            sig, rets = sig.split(" -> ", 1)
+            rets = rets.strip()
+        if "(" not in sig:
+            # Property access like .len -> i64
+            name = sig.lstrip(".")
+            return name, None, rets
+        head, rest = sig.split("(", 1)
+        params_raw = rest.rsplit(")", 1)[0].strip()
+        tyargs = ""
+        if "<" in head:
+            head, tyargs = head.split("<", 1)
+            tyargs = "<" + tyargs
+        if "." in head:
+            recv, name = head.split(".", 1)
+            recv = recv.strip() or member_recv
+        else:
+            recv, name = None, head.strip()
+        raw_parts = [p.strip() for p in params_raw.split(",")] if params_raw else []
+        # Expand optional `x?` and normalize prose variadics (`a, b, ...` -> `values...`, `x, ...` -> `x...`).
+        variants = [[]]
+        i = 0
+        while i < len(raw_parts):
+            p = raw_parts[i]
+            if i + 2 == len(raw_parts) - 1 and raw_parts[i] == "a" and raw_parts[i + 1] == "b" and raw_parts[i + 2] == "...":
+                for v in variants:
+                    v.append("values...")
+                break
+            if i + 1 == len(raw_parts) - 1 and raw_parts[i + 1] == "...":
+                for v in variants:
+                    v.append(p + "...")
+                break
+            if p.endswith("?"):
+                base = p[:-1]
+                variants = variants + [v + [base] for v in variants]
+            else:
+                for v in variants:
+                    v.append(p)
+            i += 1
+        forms = []
+        for plist in variants:
+            norm = []
+            if recv is not None:
+                norm.append((recv, ""))
+            for p in plist:
+                variadic = p.endswith("...")
+                left, _, ptype = p.partition(":")
+                pname = left.removesuffix("...").strip()
+                norm.append((pname + ("..." if variadic else ""), ptype.removesuffix("...").strip()))
+            forms.append((tyargs, tuple(norm), rets))
+        return name, forms, ""
+
+    cpp_docs = {}
+    cpp_text_docs = {}
+    for line in m_docs.group(1).splitlines():
+        m = re.match(r'\s*\{\s*(\w+)\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*\},', line)
+        if not m:
+            continue
+        kind, forms_raw, doc_raw = m.groups()
+        name, flags = defs[kind]
+        forms_str = parse_cpp_str(forms_raw)
+        cpp_text_docs[name] = parse_cpp_str(doc_raw)
+        if "BF_PROPERTY" in flags:
+            cpp_docs[name] = ("property", [])
+        else:
+            parsed = []
+            for f in forms_str.split("\n"):
+                fn, fforms, _ = parse_sig(f)
+                if fn != name:
+                    raise RuntimeError(f"builtindocs name mismatch for {kind}: {fn} != {name}")
+                parsed.extend(fforms)
+            cpp_docs[name] = ("fn", parsed)
+
+    if set(cpp_docs) != {n for n, _ in defs.values()}:
+        raise RuntimeError(f"builtindocs set mismatch: {set(cpp_docs) ^ {n for n, _ in defs.values()}}")
+    if "shrink" not in cpp_text_docs["resize"].lower():
+        raise RuntimeError(f"resize doc must reflect shrink-only 2-arg form: {cpp_text_docs['resize']}")
+
+    def section_block(text, start_pat, end_pat):
+        m = re.search(start_pat + r"(.*?)" + end_pat, text, re.S)
+        if not m:
+            raise RuntimeError(f"cannot find section: {start_pat}")
+        return m.group(1)
+
+    def table_entries(block, member_recv=None, share_row_ret=False):
+        entries = {}
+        in_table = False
+        for line in block.splitlines():
+            if line.startswith("|---"):
+                in_table = True
+                continue
+            if in_table:
+                if not line.startswith("|"):
+                    in_table = False
+                    continue
+                col0 = line.split("|")[1]
+                codes = re.findall(r"`([^`]+)`", col0)
+                row_ret = ""
+                if share_row_ret and " or " in col0 and " -> " in col0:
+                    row_ret = col0.rsplit(" -> ", 1)[1].rstrip("` ").strip()
+                for code in codes:
+                    if code.endswith("(...)"):
+                        continue
+                    if row_ret and " -> " not in code:
+                        code = f"{code} -> {row_ret}"
+                    name, forms, prop_ret = parse_sig(code, member_recv=member_recv)
+                    if forms is None:
+                        entries[name] = ("property", prop_ret)
+                    else:
+                        entries.setdefault(name, ("fn", []))[1].extend(forms)
+        return entries
+
+    ref_members = table_entries(section_block(ref_text, r"### Members\n", r"\n### "), member_recv="a")
+    ref_pools = table_entries(section_block(ref_text, r"## 14\. Reusable pools\n", r"\n## "), member_recv="a")
+    ref_threads = table_entries(section_block(ref_text, r"## 22\. Threads\n", r"\n---"))
+    ref_serial = table_entries(section_block(ref_text, r"## 23\. Serialization\n", r"\n---"))
+    sec25 = section_block(ref_text, r"## 25\. Builtins\n", r"\n---")
+    ref_sec25 = table_entries(sec25)
+
+    spec_sec12 = section_block(spec_text, r"## 12\. Builtins, the standard library, and what v1 leaves out\n", r"\nFor serialization,")
+    spec_fns = table_entries(section_block(spec_sec12, r"The language's own functions:\n", r"\nAnd the array members"), share_row_ret=True)
+    spec_members = table_entries(section_block(spec_sec12, r"And the array members.*?:\n", r"\Z"), member_recv="a")
+    spec_all = {**spec_fns, **spec_members}
+
+    canonical = {}
+    for tbl in (ref_members, ref_pools, ref_threads, ref_serial):
+        canonical.update(tbl)
+    for name in ("print", "str", "format", "assert", "abort", "exit", "copy", "default",
+                 "embed_file", "embed_shader", "src_file", "src_line"):
+        if name not in ref_sec25:
+            raise RuntimeError(f"reference.md §25 missing {name}")
+        canonical[name] = ref_sec25[name]
+
+    for name in cpp_docs:
+        if not re.search(rf"\b{re.escape(name)}\b", sec25):
+            raise RuntimeError(f"reference.md §25 fails to mention builtin {name}")
+    if set(canonical) != set(cpp_docs):
+        raise RuntimeError(f"reference.md tables vs builtins.h mismatch: {set(canonical) ^ set(cpp_docs)}")
+    if set(spec_all) != set(cpp_docs):
+        raise RuntimeError(f"goose_spec.md §12 vs builtins.h mismatch: {set(spec_all) ^ set(cpp_docs)}")
+
+    # Parameters whose runtime acceptance is polymorphic / CheckByteOut and must stay untyped.
+    must_be_untyped = {
+        ("print", 0), ("str", 0), ("format", 0), ("format", 1), ("assert", 0),
+        ("thread_spawn", 0), ("thread_spawn", 1), ("thread_spawn_contained", 0), ("thread_spawn_contained", 1),
+        ("thread_wait", 1), ("to_bytes", 0), ("to_bytes", 1), ("bytes_of", 0), ("append", 1),
+    } | {(n, 0) for n, fl in defs.values() if "BF_MEMBER" in fl and "BF_PROPERTY" not in fl and n != "move_from"}
+
+    def normalize_doc_forms(name, forms, strip_types=True, spec_fallback=None):
+        out = []
+        for tyargs, params, rets in forms:
+            if name == "move_from" and tuple(p for p, _ in params) == ("a", "src"):
+                params = (("dst", params[0][1]), params[1])
+            if name == "from_bytes":
+                tyargs = tyargs.replace("T[>..]", "A")
+                rets = rets.replace("T[>..]", "A")
+            if spec_fallback and name in spec_fallback:
+                rets = spec_fallback[name]
+            if strip_types:
+                params = tuple((p, "") for p, _ in params)
+            out.append((tyargs, params, rets))
+        return sorted(out)
+
+    spec_ret_only = {n: spec_all[n][1][0][2] for n in ("embed_file", "src_file", "src_line")}
+    for name, (kind, c_forms) in cpp_docs.items():
+        r_kind, r_forms = canonical[name]
+        s_kind, s_forms = spec_all[name]
+        if kind == "property":
+            if r_kind != "property" or r_forms != "i64" or s_kind != "property" or s_forms != "i64":
+                raise RuntimeError(f"property mismatch for {name}: ref={r_kind}:{r_forms}, spec={s_kind}:{s_forms}")
+            continue
+        for _ty, params, _ret in c_forms:
+            for idx, (_pn, pt) in enumerate(params):
+                if (name, idx) in must_be_untyped and pt:
+                    raise RuntimeError(f"{name} param {idx} must be untyped in builtindocs, got {pt!r}")
+        norm_c_untyped = normalize_doc_forms(name, c_forms, strip_types=True)
+        norm_s_untyped = normalize_doc_forms(name, s_forms, strip_types=True)
+        if norm_s_untyped != norm_c_untyped:
+            raise RuntimeError(f"builtin spec drift for {name}:\n  builtins.h:   {norm_c_untyped}\n  goose_spec:   {norm_s_untyped}")
+        if name != "embed_shader":
+            norm_r_untyped = normalize_doc_forms(name, r_forms, strip_types=True, spec_fallback=spec_ret_only)
+            if norm_r_untyped != norm_c_untyped:
+                raise RuntimeError(f"builtin reference drift for {name}:\n  builtins.h:   {norm_c_untyped}\n  reference.md: {norm_r_untyped}")
+        # Whenever reference.md or spec states a parameter type (e.g. abort(msg: u8[:]), exit(code: i64), from_bytes(b: u8[:])), verify exact match.
+        for doc_src, d_forms in (("reference.md", r_forms), ("goose_spec.md", s_forms)):
+            for d_ty, d_params, _ in d_forms:
+                for c_ty, c_params, _ in c_forms:
+                    if len(d_params) == len(c_params):
+                        for idx, ((dp, dt), (cp, ct)) in enumerate(zip(d_params, c_params)):
+                            if dt and dt != ct:
+                                raise RuntimeError(f"{name} param {idx} ({cp}) type drift vs {doc_src}: {ct!r} != {dt!r}")
+
 def check_lsp_protocol(exe, base):
     """Raises RuntimeError on a failure."""
+    check_builtin_docs_sync(HERE.parent)
     base = Path(base).resolve()
     base.mkdir(parents=True, exist_ok=True)
     code, out, err = tc.run_capture([exe, "lsp", "--probe"])
@@ -229,15 +454,29 @@ def check_lsp_protocol(exe, base):
                 if not any(s["name"] == name and s["kind"] == kinds[symkind] for s in got or []):
                     fail(f"symbol {name} ({symkind})", got)
             elif kind == "signature":
-                pos, want, active = re.match(r'(\S+) "(.*)" (\d+)$', rest).groups()
+                if rest.endswith(" none"):
+                    pos = rest[:-5]
+                    got = client.request("textDocument/signatureHelp", {**doc, "position": position(pos)})
+                    if got:
+                        fail(f"signature {pos} is not none", got)
+                    continue
+                pos, want, active, param_label, only = re.match(
+                    r'(\S+) "([^"]*)" (\d+)(?: "([^"]*)")?( only)?$', rest).groups()
                 got = client.request("textDocument/signatureHelp", {**doc, "position": position(pos)})
                 if (not got or got["signatures"][got["activeSignature"]]["label"] != want or
-                        got["activeParameter"] != int(active)):
+                        got["activeParameter"] != int(active) or (only and len(got["signatures"]) != 1)):
                     fail(f"signature {pos}", got)
+                if param_label is not None:
+                    sig = got["signatures"][got["activeSignature"]]
+                    if (got["activeParameter"] >= len(sig["parameters"]) or
+                            sig["parameters"][got["activeParameter"]]["label"] != param_label or
+                            not sig.get("documentation", {}).get("value")):
+                        fail(f"signature {pos} param {param_label}", got)
             elif kind == "complete":
-                # `has NAME` / `lacks NAME`: labels; optional text checks detail.
+                # `has NAME` / `lacks NAME`: labels; optional text checks detail and doc.
                 # `inserts NAME`: the item inserts that spelling, as a client would.
-                pos, mode, name, detail = re.match(r'(\S+) (has|lacks|inserts) (\S+)(?: "(.*)")?$', rest).groups()
+                pos, mode, name, detail, doc_sub = re.match(
+                    r'(\S+) (has|lacks|inserts) (\S+)(?: "([^"]*)")?(?: "([^"]*)")?$', rest).groups()
                 got = client.request("textDocument/completion", {**doc, "position": position(pos)})
                 items = {item["label"]: item for item in (got or {}).get("items", [])}
                 if mode == "inserts":
@@ -249,12 +488,15 @@ def check_lsp_protocol(exe, base):
                     fail(f"completion {pos} {mode} {name}", sorted(items))
                 if detail and detail not in items[name].get("detail", ""):
                     fail(f"completion {pos} {name}'s detail lacks {detail}", items[name])
+                if doc_sub and doc_sub not in items[name].get("documentation", {}).get("value", ""):
+                    fail(f"completion {pos} {name}'s documentation lacks {doc_sub}", items[name])
             elif kind == "token":
-                # `none`: no token at the place.
+                # `none`: no token at the place; `type+mod1+mod2` or `type+none` checks modifiers too.
                 pos, want = rest.split()
                 got = client.request("textDocument/semanticTokens/full", doc)
                 legend = ["namespace", "type", "struct", "enum", "enumMember", "typeParameter",
                           "parameter", "variable", "property", "function", "method"]
+                mod_legend = ["declaration", "readonly", "defaultLibrary"]
                 data = got["data"]
                 tokens = {}
                 line = char = 0
@@ -262,10 +504,17 @@ def check_lsp_protocol(exe, base):
                     dline, dchar, length, ttype, mods = data[i:i + 5]
                     line += dline
                     char = char + dchar if dline == 0 else dchar
-                    tokens[(line, char)] = legend[ttype]
+                    tokens[(line, char)] = (legend[ttype], [mod_legend[b] for b in range(3) if mods & (1 << b)])
                 p = position(pos)
-                if tokens.get((p["line"], p["character"]), "none") != want:
-                    fail(f"token {pos} is not {want}", {"at": p, "got": tokens.get((p["line"], p["character"]))})
+                tok = tokens.get((p["line"], p["character"]))
+                if not tok:
+                    got_tok = "none"
+                elif "+" in want:
+                    got_tok = "+".join([tok[0]] + (tok[1] or ["none"]))
+                else:
+                    got_tok = tok[0]
+                if got_tok != want:
+                    fail(f"token {pos} is not {want}", {"at": p, "got": tok})
             elif kind == "references":
                 pos, want = rest.split()
                 got = client.request("textDocument/references",
@@ -460,6 +709,11 @@ def check_lsp_protocol(exe, base):
     ufcs = fixtures / "ufcs_ns.goose"
     utext = ufcs.read_text(encoding="utf-8")
     queries(ufcs, utext, open_fixture(ufcs, utext))
+    # Names spelled through a namespace alias, `g::x` for geo::x: the
+    # occurrence is the spelling as written, not the name it is read as.
+    alias = fixtures / "ns_alias.goose"
+    atext = alias.read_text(encoding="utf-8")
+    queries(alias, atext, open_fixture(alias, atext))
 
     # Statements with errors inside the braces of a struct literal or a
     # match they opened: each published where it is, and nothing after
@@ -485,6 +739,11 @@ def check_lsp_protocol(exe, base):
                      HERE / "errors_tc" / "recovery" / "exemplar_unchecked.goose"):
         etext = exemplar.read_text(encoding="utf-8")
         queries(exemplar, etext, open_fixture(exemplar, etext))
+    # Builtin functions and array properties: hover, definition, signature help,
+    # completion, semantic tokens, and inlay hints.
+    builtins = fixtures / "builtins.goose"
+    buitext = builtins.read_text(encoding="utf-8")
+    queries(builtins, buitext, open_fixture(builtins, buitext))
 
     # Roots as files open and close (docs/design/language_server.md §4),
     # judged by the diagnostics an editor has once a request has had the
@@ -681,3 +940,145 @@ def check_lsp_protocol(exe, base):
     code = two.p.wait(timeout=30)
     if code != 0:
         raise RuntimeError(f"goose lsp exited with {code}:\n{tc.decode(two.p.stderr.read())}")
+    check_buffer_imports(exe, base / "buffer_imports")
+    check_position_encodings(exe, fixtures, fail)
+
+
+def check_buffer_imports(exe, base):
+    """Unsaved modules take the same import precedence as saved ones."""
+    base = Path(base).resolve()
+    for case, name in (("plain", "buffer_module"), ("local", "math"), ("blessed", "gfx"),
+                       ("stdlib", "math"), ("empty", "math"), ("package", "buffer_pkg")):
+        directory = base / case
+        directory.mkdir(parents=True, exist_ok=True)
+        root = directory / "main.goose"
+        libdir = directory / "stdlib" if case == "stdlib" else directory
+        libdir.mkdir(exist_ok=True)
+        module = libdir / f"{name}.goose"
+        if module.exists():
+            raise RuntimeError(f"buffer import fixture must not exist on disk: {module}")
+        options = {"entryFiles": [str(root)]}
+        if case == "stdlib":
+            options["stdlib"] = str(libdir)
+        declaration = f"namespace {name};\nfn buffered_value() -> i64 {{ 42 }}\n"
+        text = f"import {name};\nfn main() {{ let value = {name}::buffered_value(); }}\n"
+        if case == "empty":
+            declaration = ""
+            text = f"import {name};\nfn main() {{}}\n"
+        if case == "package":
+            package = directory / "package"
+            package.mkdir(exist_ok=True)
+            (package / f"{name}.goose").write_text(declaration, encoding="utf-8")
+            text = f'import {name} from "./package";\nimport {name};\nfn main() {{}}\n'
+        client = Client(exe, directory)
+        try:
+            client.request("initialize", {"capabilities": {}, "initializationOptions": options})
+            client.send("initialized", {}, request=False)
+            for path, body in ((module, declaration), (root, text)):
+                client.send("textDocument/didOpen", {"textDocument": {
+                    "uri": uri_of(path), "languageId": "goose", "version": 1, "text": body}}, request=False)
+            doc = {"textDocument": {"uri": uri_of(root)}}
+            target = client.request("textDocument/definition", {**doc, "position": {"line": 0, "character": 7}})
+            errors = [d for d in client.published.get(uri_of(root).lower(), []) if d.get("severity") == 1]
+            if case == "package":
+                if not any("is both a file of this package" in d["message"] for d in errors):
+                    raise RuntimeError(f"unsaved package conflict was not diagnosed: {errors}")
+            elif errors or not target or target["uri"].lower() != uri_of(module).lower():
+                raise RuntimeError(f"{case} buffer import: errors={errors}, definition={target}")
+        finally:
+            client.request("shutdown", None)
+            client.send("exit", request=False)
+            code = client.p.wait(timeout=30)
+            if code != 0:
+                raise RuntimeError(f"buffer import server exited with {code}:\n{tc.decode(client.p.stderr.read())}")
+
+
+def check_position_encodings(exe, fixtures, fail):
+    """Position encodings (docs/design/language_server.md §10): a client
+    offering UTF-8 gets byte columns, and one that does not, UTF-16 units,
+    in what it asks and in what it is told. Each client opens
+    encodings.goose, whose names follow characters that differ in the two."""
+    path = fixtures / "encodings.goose"
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    uri = uri_of(path)
+    doc = {"textDocument": {"uri": uri}}
+
+    def line_of(needle):
+        """The 1-based line holding needle."""
+        return next(i + 1 for i, line in enumerate(lines) if needle in line)
+
+    for offered, want in ((None, "utf-16"), (["utf-16"], "utf-16"), (["utf-32"], "utf-16"),
+                          (["utf-8", "utf-16"], "utf-8"), (["utf-32", "utf-16", "utf-8"], "utf-8")):
+        what = f"offering {offered}"
+
+        def col(line, needle, nth=0):
+            """needle's 0-based column on the 1-based line, in the encoding."""
+            at = -1
+            for _ in range(nth + 1):
+                at = lines[line - 1].index(needle, at + 1)
+            prefix = lines[line - 1][:at]
+            return len(prefix.encode()) if want == "utf-8" else len(prefix.encode("utf-16-le")) // 2
+
+        def pos(line, needle, nth=0):
+            return {"line": line - 1, "character": col(line, needle, nth)}
+
+        caps = {} if offered is None else {"general": {"positionEncodings": offered}}
+        client = Client(exe, fixtures)
+        init = client.request("initialize", {"processId": None, "rootUri": uri_of(fixtures), "capabilities": caps,
+                                             "initializationOptions": {"entryFiles": [str(path)]}})
+        got = init["capabilities"].get("positionEncoding")
+        if got != want:
+            fail(f"{what}: the position encoding is not {want}", init["capabilities"])
+        client.send("initialized", {}, request=False)
+        client.send("textDocument/didOpen", {"textDocument": {
+            "uri": uri, "languageId": "goose", "version": 1, "text": text}}, request=False)
+        diags = client.diagnostics_for(uri, lambda d: len(d) > 0)
+
+        # The error at `missing`, after é and 🦆 on its line.
+        bad = line_of("missing")
+        errors = [d for d in diags if d["severity"] == 1]
+        if (len(errors) != 1 or errors[0]["range"]["start"] != pos(bad, "missing") or
+                errors[0]["range"]["end"] != {"line": bad - 1, "character": col(bad, "missing") + len("missing")}):
+            fail(f"{what}: the error is not at `missing` in {want} columns", diags)
+
+        # A use after 🦆🦆, and its declaration after é∑🦆: the position
+        # asked is read in the encoding, and the place answered written in it.
+        decl, use = line_of("let total"), line_of("print(")
+        got = client.request("textDocument/definition", {**doc, "position": pos(use, "total")})
+        if not got or got["range"]["start"] != pos(decl, "total"):
+            fail(f"{what}: the definition of total is not at {decl}:{col(decl, 'total')}", got)
+        got = client.request("textDocument/hover", {**doc, "position": pos(use, "total")})
+        if not got or "total" not in got["contents"]["value"]:
+            fail(f"{what}: no hover of total", got)
+        got = client.request("textDocument/references", {**doc, "position": pos(decl, "total"),
+                                                         "context": {"includeDeclaration": True}})
+        if sorted((r["range"]["start"]["line"], r["range"]["start"]["character"]) for r in got or []) != \
+                sorted([(decl - 1, col(decl, "total")), (use - 1, col(use, "total"))]):
+            fail(f"{what}: the references of total", got)
+
+        # Semantic tokens: total's at its use starts where it does in the
+        # encoding and is five units long in both.
+        got = client.request("textDocument/semanticTokens/full", doc)
+        data, tokens, line, char = got["data"], {}, 0, 0
+        for i in range(0, len(data), 5):
+            dline, dchar, length = data[i:i + 3]
+            line += dline
+            char = char + dchar if dline == 0 else dchar
+            tokens[(line, char)] = length
+        if tokens.get((use - 1, col(use, "total"))) != len("total"):
+            fail(f"{what}: no five-unit token for total at {use}:{col(use, 'total')}", tokens)
+
+        # A UTF-8 column inside 🦆 is taken back to the duck's start, which
+        # holds no name; in UTF-16 the same number is a column of its own.
+        if want == "utf-8":
+            inside = {"line": use - 1, "character": col(use, "🦆") + 2}
+            got = client.request("textDocument/hover", {**doc, "position": inside})
+            if got:
+                fail(f"{what}: a hover inside 🦆", got)
+
+        client.request("shutdown", None)
+        client.send("exit", request=False)
+        code = client.p.wait(timeout=30)
+        if code != 0:
+            raise RuntimeError(f"goose lsp exited with {code}:\n{tc.decode(client.p.stderr.read())}")

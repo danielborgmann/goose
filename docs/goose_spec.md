@@ -822,6 +822,10 @@ rebinding the variable ends the narrowing. `o .= &x` / `o .= null` rebind
 an optional. A rebind to a plain reference narrows it, and a rebind to
 anything that may be null un-narrows it.
 
+Only variables narrow. Bind an optional field or element to a local with
+`.=` before testing and using it. For example, write
+`let next .= node.next; if next { print(next.key); }`.
+
 **What references may point to.** Anything except the interior of a
 fixed-mode ADT payload (§3.5). A reference into a grow-shrink array `[>..<]`
 is held only in a variable, and must no longer be live when the array next
@@ -3531,7 +3535,15 @@ function. It initializes the runtime and the globals and then runs the Goose
 start-up code; exported functions may be called from it. A second call does
 nothing. Initialization is idempotent on the initializing thread; exported
 calls and mutable Goose globals are not thread-safe and must remain on that
-thread. `--header` requires generated C output and at least one export, and
+thread. Only the C host calls an export through its C symbol, between its
+calls into Goose. C that Goose code called (an `extern fn`, from `main`, a
+worker or a global's initializer) calling an export before it returns is a
+runtime error, since the export would run over the data stacks of the Goose
+code that is still running. In a program that starts threads, a call on a
+thread other than the initializing one is a runtime error too. An `extern
+fn` whose C symbol is one of the program's exports is a compile error: Goose
+code calls the export as the Goose function it is. `--header` requires
+generated C output and at least one export, and
 writes declarations and the required packed C type definitions for the
 exported API.
 
@@ -3678,6 +3690,31 @@ block written inside a `checkfree` function is checked as part of it.
   error with `extern`. A nested function inherits it. Under `--no-bce`
   nothing is verified, and the compiler warns about this.
 
+### 7.15 `deprecated fn`: a call warns
+
+```goose
+deprecated "use copy_from" fn copy_into<T>(dst: T[:], src: T[:]) {
+    copy_from(dst, src);
+}
+```
+
+`deprecated` marks a function that still works and that a program should
+stop calling. It changes nothing about what the program computes.
+
+* A direct call warns, whether it is written `copy_into(dst, src)` or
+  `dst.copy_into(src)`. Naming the function as a value warns there. A later
+  call through that value does not warn again. The warning names the
+  function and, where the declaration gives a string, repeats it:
+  `copy_into is deprecated: use copy_from`. With no string the warning is
+  `copy_into is deprecated`. A call site in a fetched or builtin package does
+  not warn, since it is up to that package's authors to change it.
+* The string is an ordinary string literal. `deprecated` comes before the
+  other qualifiers (`checkfree`, `export`, `extern`, `simd`, `inline`,
+  `recursive`), and the string, when there is one, follows `deprecated`
+  immediately.
+* `deprecated` is a keyword only in that position, so it stays usable as a
+  name. It applies to nested functions and to `extern fn` the same way.
+
 ## 8. ADTs in use
 
 ### 8.1 `match`
@@ -3764,8 +3801,10 @@ let a = area(s);     // s: Shape — dispatches on the tag, like a match
 * Calling the overload set with the ADT type (or a reference to it)
   performs tag dispatch (a jump table). Exhaustiveness is checked as for
   `match`: every variant must have exactly one applicable overload, and the
-  return types must agree. All arms construct any nonfixed result in the
-  same destination (§4.3). The overloads' parameter types choose copy or
+  return types must agree. An overload taking the ADT itself in that
+  position is an ordinary candidate, not a case: `f(k: Shape, x: f64)`
+  called as `f(s, 2)` is that call, with its integer converted (§7.1).
+  All arms construct any nonfixed result in the same destination (§4.3). The overloads' parameter types choose copy or
   reference as match binders do (`Shape.Circle` vs `Shape.Circle&`), with
   the same rules: a fixed-mode or resizable scrutinee, even behind a
   reference, dispatches only to by-value variant parameters (§3.5), and a
@@ -4479,6 +4518,18 @@ it leaves the caller's own facts about `src` intact.
   Namespaces affect only name resolution, type identity and generated C
   names (§7.10); they have no runtime representation, and they provide no
   privacy and no re-exports.
+* **Namespace aliases.** `namespace g = image;`, written before a file's
+  declarations, makes `g::x` read as `image::x` in every qualified
+  reference of that file (an expression, a type, a variant, a pool, a match
+  pattern's constant, `return ... from`). The alias holds in that file
+  alone: neither the files it imports nor those importing it see it. A
+  file may declare several. The target must be a namespace some file
+  declares with `namespace target;` (whether or not anything is declared
+  in it), and is never another alias. An alias may take the name of a
+  namespace, which its file then reaches only through another alias, but
+  not the name of the file's own namespace. A declaration's qualifier
+  names the namespace itself, never an alias (`fn g::f` is an error).
+  Diagnostics and dumps name the target (`image::x`).
 * Globals are declared like locals (`let`/`var`, any type including
   resizable). Semantically, the program runs inside an implicit outermost
   scope that owns the globals. They take part in the depth check (§9.2) as
@@ -4612,7 +4663,11 @@ relative of the Linda tuple-space / coordination style.
   `qget<T>(ms: i64) -> T, bool` (like `qpoll`, after waiting at most `ms`
   milliseconds; zero or less does not wait) and `qlimit<T>(n: i64)` select
   the queue by type. Queues are stored outside stack memory
-  (runtime-internal allocation is permitted here).
+  (runtime-internal allocation is permitted here). `qput` uses the queue of
+  its argument's type: a variant literal has its variant type (§3.5) and an
+  integer literal is an `i64`, so `qput(Shape.Circle { r: 1.0 })` does not
+  feed `qget<Shape>()`. A `qget` or `qpoll` of a type that no `qput` in the
+  program sends is a warning, since it can receive nothing.
 * **Bounded queues**: `qput` never blocks. It returns `true` once the value
   is queued, and returns `false` immediately, queueing nothing, when the
   queue holds its limit of messages. A call statement drops the result
@@ -4646,8 +4701,10 @@ The language's own functions:
 | `hardware_threads() -> i64`, `thread_spawn(worker, args…) -> i64`, `thread_spawn_contained(worker, args…) -> i64`, `thread_wait(id) -> bool`, `thread_wait(id, msg) -> bool` | workers (§11.2) |
 | `qput(v) -> bool`, `qget<T>() -> T`, `qget<T>(ms) -> T, bool`, `qpoll<T>() -> T, bool` | the typed queues (§11.2) |
 | `qlimit<T>(n)` | a queue's limit of messages (§11.2) |
+| `par_threads(n) -> i64`, `par_spin_us(us) -> i64`, `par_warm() -> i64` | `par for`'s pool: its size, its wait before sleeping, an early start (FastGoose) |
+| `racy(v) -> T` | a `racy` view of a resizable array or a struct, for a worker to read while main changes it (FastGoose) |
 | `to_bytes(a) -> u8[>..]`, `to_bytes(a, out)` | an array's image (a varint byte count, then its element region), either fresh or appended to a growable `u8` array (§3.9, `design/serialization.md`) |
-| `bytes_of(a) -> u8[:]` | the element region alone, as a view: no copy, and never writable |
+| `bytes_of(a) -> const u8[:]` | the element region alone, as a view: no copy, and never writable |
 | `from_bytes<T[>..]>(b: u8[:]) -> T[>..], bool` | a *verified* array from an untrusted image; empty and `false` if it is not one. Also builds `T[>..<]` and the `T[]` family |
 | `embed_shader(path)` or `embed_shader(stage, source, …) -> const u8[:]` | compile-time GLSL compilation to a static shader blob; graphics extension, detailed in the implementation notes, section 3.14 |
 | `embed_file(path) -> const u8[:]` | the bytes of a file, read when the program is compiled, as a view of static data; `path` is a string literal (or a `let`/`const` global holding one), relative to the file with the call; each distinct file is read once |
@@ -4668,6 +4725,7 @@ And the array members, ordinary functions of their receiver per UFCS
 | `.range_index(s, msg?) -> i64` | the same, fixed-size elements | checked start of a contained slice; zero for empty (§3.3) |
 | `.check_length(n, msg?) -> i64` | grow-only, grow-shrink, fixed-size elements | validate a count without allocating (§3.3) |
 | `.move_from(src)` | slices, fixed-size elements | checked equal-length copy, safe for overlapping slices (§3.3) |
+| `.atomic_or(w, bits) -> T`, `.atomic_add(w, n) -> T`, `.atomic_load(w) -> T` | `i64` and `u64` arrays | one atomic access to word `w`; a `par for`'s iterations may share the array (FastGoose) |
 | `.alloc_index(v) -> i64`, `.alloc_ref(v) -> T&`, `.free(i)` | deprecated `reusable` pools | slot reuse (§5.4); prefer stdlib `slot_pool<T>` |
 | `.alloc_slice(n) -> T[:]`, `.realloc_slice(s, n) -> T[:]`, `.free_slice(s)` | deprecated `reusable[]` pools | slice reuse (§5.4); prefer stdlib `slice_pool<T>` |
 
@@ -5098,7 +5156,9 @@ Construction rules (§4.2) write stacks front-to-back. Windows commits on
 fault: the runtime's handler commits a chunk from whichever page
 was touched, so an allocation that skips ahead without writing (a large
 limited-array capacity) needs no explicit commit, and nothing depends on
-touch order. macOS and Linux map the usable region read/write and let the
+touch order. A read below the highest committed page commits only its own
+page, so a stale view of a run that `slice_pool`'s `trim` discarded does
+not take back its neighbors. macOS and Linux map the usable region read/write and let the
 kernel supply physical pages on touch. Fresh pages, including pages
 discarded by `trim_memory`, arrive zeroed from the OS. Reused stack memory
 is not zeroed. This is harmless, since uninitialized slots are unreachable
@@ -5110,8 +5170,9 @@ growth into a safe abort.
 ## Appendix D. Grammar sketch (informative)
 
 ```
-program     := namespace? topdecl*             // imports may precede namespace
+program     := (namespace | nsalias | import)* topdecl*  // namespace at most once
 namespace   := "namespace" ident ";"
+nsalias     := "namespace" ident "=" ident ";"      // file-local
 topdecl     := import | struct | enum | typealias | fndecl | externblock | globaldecl
 import      := "import" "."? ident ("." ident)* ";" | "import" ident "from" strlit ";"
 declname    := ident | ident "::" ident | "::" ident   // the namespace, else the file's
@@ -5124,12 +5185,13 @@ field       := ("let" | "const")? ident ":" type ("=" expr)? | "pad" intlit?
 typealias   := "type" declname "=" type ";"
 generics    := "<" ident (":" type)? ("," ident (":" type)?)* ">"
 
-fndecl      := "checkfree"? ("export" strlit? | "extern" strlit?)? "checkfree"? "simd"?
-               "inline"? "recursive"? ("fn" | "thread_fn")
+fndecl      := "deprecated" strlit? "checkfree"? ("export" strlit? | "extern" strlit?)?
+               "checkfree"? "simd"? "inline"? "recursive"? ("fn" | "thread_fn")
                declname generics? "(" params? ")" ("->" rettypes)?
                (blockexpr | ("=" strlit)? ";")
                                                  // "=" strlit: extern only, its C symbol
                                                  // "extern" strlit: deprecated, the same
+                                                 // "deprecated" strlit: a call or value warns (§7.15)
                                                  // checkfree at most once (§7.14)
                                                  // nested: ident only
 externblock := "extern" strlit "{" externmember* "}"   // §7.10: the library, then its functions

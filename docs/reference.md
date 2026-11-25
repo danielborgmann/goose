@@ -67,8 +67,8 @@ without running, and `goose build` makes an executable
 ## 1. Lexical structure
 
 A Goose source file is UTF-8 text. A byte-order mark at its start is
-ignored, and line endings are read as `\n` whatever convention the file
-uses.
+ignored. Lines end in LF or CRLF, both read as `\n`; a carriage return
+without a line feed after it is an error.
 
 **Comments** are `//` to the end of the line and `/* … */`, which nests:
 `/* a /* b */ c */` is one comment.
@@ -77,9 +77,9 @@ uses.
 [Appendix A](#appendix-a-keywords-and-operators). A few words are keywords
 only in one position and names everywhere else: `from` after a `return`
 value, `upto` after an unsigned type in a type, `inline` and `checkfree`
-before `fn`, `fields`, `variants` and `types` in a `const for` header, and
-`has_default` and `same` in a `const if` condition. `in` is a keyword
-throughout.
+before `fn`, `deprecated` before the other function qualifiers, `fields`,
+`variants` and `types` in a `const for` header, and `has_default` and
+`same` in a `const if` condition. `in` is a keyword throughout.
 
 **Integer literals** are decimal (`42`) or hexadecimal (`0xFF`). The whole
 unsigned 64-bit range is accepted: a value above `i64.max` is a `u64`
@@ -915,6 +915,9 @@ read the same way.
 | `.clear()` | the same | empties the array |
 | `.index_of(r) -> i64` | arrays of fixed-size elements | the index of the element `r` refers to |
 | `.range_index(s, msg?) -> i64` | the same | the start of a wholly contained slice; checked when provenance does not prove it |
+| `.atomic_or(w, bits) -> T` | `i64` and `u64` arrays | ors `bits` into word `w` atomically; returns the word as it was (FastGoose, `par for`) |
+| `.atomic_add(w, n) -> T` | the same | adds `n` to word `w` atomically; returns the word as it was (FastGoose) |
+| `.atomic_load(w) -> T` | the same | reads word `w` atomically (FastGoose) |
 | `.check_length(n, msg?) -> i64` | grow-only, grow-shrink, fixed-size elements | validates a count against the data-stack reservation; returns it without changing the array |
 
 Growth always supplies element values: there is no operation that exposes
@@ -3309,9 +3312,19 @@ Spec §7.5.
 | `checkfree fn` | no bounds check may remain in it | [15](#checkfree-fn) |
 | `inline fn` | inlined at every call, whatever its size | below |
 | `simd fn` | built once per instruction-set level | below |
+| `deprecated fn` | a call or a use as a value warns | below |
 
-The qualifiers come in a fixed order: `export` or `extern` first, then
-`checkfree`, `simd`, `inline`, `recursive`, and `fn` or `thread_fn`.
+The qualifiers come in a fixed order: `deprecated` and its optional
+message first, then `export` or `extern`, then `checkfree`, `simd`,
+`inline`, `recursive`, and `fn` or `thread_fn`.
+
+`deprecated "use copy_from" fn copy_into(...)` keeps the old function and
+warns at a direct call and where the function is named as a value, except at
+use sites in fetched or builtin packages, whose authors are to change them.
+The warning repeats the string: `copy_into is deprecated: use copy_from`.
+Without the string it is `copy_into is deprecated`. A call through a
+value already warned about does not warn again. `deprecated` is a name
+everywhere it is not that qualifier. Spec §7.15.
 
 `inline` asks for the function to be inlined at every call; without it
 the compiler decides from the function's size and its number of calls.
@@ -3777,6 +3790,13 @@ variables to functions. Namespaces affect only name resolution, type
 identity and generated C names. There is no privacy, no re-export and no
 nesting of namespaces. Spec §11.1, `docs/design/namespaces.md`.
 
+`namespace g = goose_gfx2d;`, before a file's declarations, lets that file
+write `g::Sprite` for `goose_gfx2d::Sprite`, in any qualified name. The
+alias holds in that file alone, so a library's aliases never reach the
+files that import it, and it may even take the name of another namespace
+without affecting any other file. Its target must be a namespace some file
+declares. Errors and `--dump` name the target: `goose_gfx2d::Sprite`.
+
 ### Globals and initialization
 
 Globals are initialized before `main`, in declaration order within a
@@ -3864,6 +3884,10 @@ locks, atomics or memory orderings.
 | `thread_wait(id) -> bool` | blocks until that worker has ended and its storage is released; `false` if it was contained and aborted |
 | `thread_wait(id, msg) -> bool` | as `thread_wait(id)`, and the first such wait appends a contained worker's abort message to `msg` |
 | `hardware_threads() -> i64` | a sensible worker count, never more than the data stacks allow |
+| `par_threads(n) -> i64` | the `par for` pool's size from the next fork on, 0 the default; returns the size it will be (FastGoose) |
+| `par_spin_us(us) -> i64` | how long a pool thread waits for the next fork before it sleeps, below 0 the default; returns it (FastGoose) |
+| `par_warm() -> i64` | starts the pool without a fork; returns its size (FastGoose) |
+| `racy(v) -> T` | a `racy T[:]` of resizable array `v`, or a `racy S` of struct `v`, for a worker to read while main changes it (FastGoose) |
 | `qput(v) -> bool` | puts `v` on the queue for its type; `false`, at once, if the queue is full |
 | `qget<T>() -> T` | takes the next `T`, blocking |
 | `qget<T>(ms) -> T, bool` | the same, waiting at most `ms` milliseconds; else `T`'s zero value and `false` |
@@ -3876,6 +3900,11 @@ holds no references or slices at any depth. This is cheap because a flat
 Goose value is contiguous, so a job or a result carries real data,
 including its variable-size parts, as a single copy. A `thread_fn`'s
 parameters have no defaults.
+
+The queue is the one for the type the value has: a variant literal such as
+`Shape.Circle { r: 1.0 }` has its variant's type, and `7` is an `i64`, so
+neither reaches a `qget<Shape>()` or a `qget<i32>()`. A `qget` or `qpoll`
+of a type that no `qput` in the program sends gives a warning.
 
 <!-- check-only -->
 ```goose
@@ -3963,7 +3992,7 @@ a read. Three builtins do this for any array:
 | Builtin | Meaning |
 |---|---|
 | `to_bytes(a) -> u8[>..]`, `to_bytes(a, out)` | a framed image of the array: a varint byte count, then its element region; fresh, or appended to `out` |
-| `bytes_of(a) -> u8[:]` | the element region alone, as a read-only view: nothing copied |
+| `bytes_of(a) -> const u8[:]` | the element region alone, as a read-only view: nothing copied |
 | `from_bytes<T[>..]>(b: u8[:]) -> T[>..], bool` | a **verified** array from an untrusted image; `false` and an empty array if it is not one |
 
 Bytes arriving from outside the program are the only place a reference
@@ -4196,7 +4225,11 @@ declaring `goose_init(argc, argv)`, which the host calls once before
 anything else. That function sets up the runtime and the globals and runs
 the Goose `main`, if there is one, so `main` is where a library keeps its
 start-up code. Exported functions are not thread-safe: call them from the
-thread that called `goose_init`. `goose_exit()` ends the program and
+thread that called `goose_init`. Only the host calls them, between its
+calls into Goose: C that Goose code called calling an export back before
+it returns (a toolkit's handler, a `qsort` comparator) is a runtime error.
+Where Goose and C must interleave, have the C return to Goose rather than
+call it back. `goose_exit()` ends the program and
 releases what the start set up, so that `goose_init` can start it, or
 another build of it, again in the same process; it is a runtime error
 while a worker of the program still runs. `goose build --shared --header
@@ -4224,13 +4257,14 @@ standard library, written in Goose under `stdlib/` and documented in
 | `default<T>() -> T` | the value a fixed-size `T` has before anything is written to it, declared defaults applied | [8](#field-defaults) |
 | `hardware_threads()`, `thread_spawn(worker, args…)`, `thread_spawn_contained(worker, args…)`, `thread_wait(id)`, `thread_wait(id, msg)` | workers | [22](#22-threads) |
 | `qput(v)`, `qget<T>()`, `qpoll<T>()`, `qlimit<T>(n)` | the typed queues | [22](#22-threads) |
+| `par_threads(n)`, `par_spin_us(us)`, `par_warm()`, `racy(v)` | `par for`'s pool and racy views (FastGoose) | [22](#22-threads) |
 | `to_bytes(a)`, `to_bytes(a, out)`, `bytes_of(a)`, `from_bytes<T[>..]>(b)` | serialization | [23](#23-serialization) |
 | `embed_file(path)`, `embed_shader(…)` | a file's bytes, or a compiled shader, read at compile time | [21](#embed_file) |
 | `src_file()`, `src_line()` | the call's file name and line; a default reports the call that omitted it | [21](#src_file-and-src_line) |
 
 The array members, `.len`, `.cap`, `.push`, `.append`, `.pop`, `.pop_n`,
 `.resize`, `.clear`, `.index_of`, `.range_index`, `.check_length`, `.move_from` are in
-[section 5](#members). The stdlib pool APIs and deprecated builtin operations
+[section 5](#members). So are FastGoose's `.atomic_or`, `.atomic_add` and `.atomic_load`. The stdlib pool APIs and deprecated builtin operations
 `.alloc_index`, `.alloc_ref`, `.free`, `.alloc_slice`, `.realloc_slice`,
 `.free_slice` are in [section 14](#14-reusable-pools).
 Spec §12.
@@ -4246,8 +4280,9 @@ varint i8 i16 i32 i64 u8 u16 u32 u64 f32 f64`.
 
 **Contextual keywords**, which are ordinary names everywhere else: `from`
 (after a `return` value), `upto` (after an unsigned type in a type),
-`inline` and `checkfree` (before `fn`, `recursive`, `simd` or
-`thread_fn`), `fields`, `variants` and `types` (in a `const for` header),
+`inline` and `checkfree` (before `fn`, `recursive`, `simd` or `thread_fn`),
+`deprecated` (before the other function qualifiers, optionally followed by
+a string), `fields`, `variants` and `types` (in a `const for` header),
 `has_default` and `same` (in a `const if` condition).
 
 **Operators**, tightest first; the precedence is Rust's:

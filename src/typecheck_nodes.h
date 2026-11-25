@@ -159,6 +159,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
     FnSpec *env = nullptr;
     if (auto fns = tc.LookupLocalFns(name, env); !fns.empty()) {
         fnref = fns[0];
+        WarnDeprecatedValue(tc, this, fns);
         Val v;
         v.type = tc.fntype;
         v.fnv = tc.LocalFnValue(fns, env);
@@ -166,6 +167,7 @@ inline Val Ident::Check(TypeCheck &tc, TypeExpr *) {
     }
     if (auto &cands = tc.ast.LookupFunctions(name, ns); !cands.empty()) {
         fnref = cands[0];
+        WarnDeprecatedValue(tc, this, cands);
         for (auto sf : cands)
             if (sf->brokensig) throw Abandoned {};
         Val v;
@@ -467,8 +469,7 @@ inline Val Dot::Check(TypeCheck &tc, TypeExpr *) {
     obj->exprtype = ov.type;
     auto t = ov.type;
     if (t->kind == TY_REF) {
-        if (t->ref->optional)
-            tc.Error(this, "optional value must be narrowed (if/guard/assert) before use");
+        if (t->ref->optional) tc.OptionalDerefError(obj, this);
         t = t->ref->sub;  // Auto-deref; ov's roots are already the pointee's owner.
         // As DerefLValue.
         ov.ClearReads();

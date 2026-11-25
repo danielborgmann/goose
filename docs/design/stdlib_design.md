@@ -310,7 +310,7 @@ fn rem<T>(a: T, b: T) -> T         // integers; pairs with `/`
 fn div_euclid<T>(a: T, b: T) -> T  // integers; pairs with `%`
 fn sign<T>(x: T) -> T           // -1, 0, 1 at x's type; f32/f64 overloads
 fn lerp(a: f64, b: f64, t: f64) -> f64      // and an f32 overload
-fn next_pow2(x: i64) -> i64     // smallest power of two >= max(x, 1)
+fn next_pow2(x: i64) -> i64     // smallest power of two >= max(x, 1); asserts x <= 2^62
 fn popcount(x: u64) -> i64
 fn clz(x: u64) -> i64           // 64 for x == 0
 fn ctz(x: u64) -> i64           // 64 for x == 0
@@ -403,7 +403,7 @@ own xorshift. To seed from the OS, use `os`'s `random_seed()`.
 
 ```goose
 fn each_rev<T, F>(xs: T[:])                    // F(x), last to first
-fn each_chunk<T, F>(xs: T[:], n: i64)          // F(chunk: T[:], i); the last chunk may be short
+fn each_chunk<T, F>(xs: T[:], n: i64)          // F(chunk: T[:], i); asserts n > 0; last chunk may be short
 fn find<T, F>(xs: T[:]) -> T?                  // first x with F(x), as a reference; null if none
 fn find_index<T, F>(xs: T[:]) -> i64           // …or its index, -1 if none
 fn position<T>(xs: T[:], v: T) -> i64          // first i with xs[i] == v, -1 if none
@@ -450,7 +450,8 @@ which uses the empty-array declaration of §8.5. `sum` needs `default<T>()`;
 
 ```goose
 fn fill<T>(xs: T[:], v: T)
-fn copy_into<T>(dst: T[:], src: T[:])            // asserts equal lengths; memmove semantics
+fn copy_from<T>(dst: T[:], src: T[:])            // asserts equal lengths; memmove semantics
+fn copy_into<T>(dst: T[:], src: T[:])            // deprecated name of copy_from; a call warns
 fn reverse<T>(xs: T[:])
 fn sort<T>(xs: T[:])                             // by <
 fn sort<T, F>(xs: T[:])                          // by F(a, b); unstable, in place, no allocation
@@ -544,7 +545,7 @@ fn format_uint(out: u8[>..]&, v: u64, base: i64, width: i64, pad: u8)
 fn format_flt(out: u8[>..]&, v: f64, decimals: i64)   // fixed decimals
 fn parse_int(s: u8[:]) -> i64, bool              // optional sign, base 10, whole string
 fn parse_int(s: u8[:], base: i64) -> i64, bool
-fn parse_flt(s: u8[:]) -> f64, bool              // sign, fraction, exponent; correctly rounded
+fn parse_flt(s: u8[:]) -> f64, bool              // sign, fraction, exponent, or inf/-inf/nan; correctly rounded
 fn compare(a: u8[:], b: u8[:]) -> i64            // bytewise lexicographic: -1, 0, 1
 fn trim(s: u8[:]) -> u8[:]                       // ASCII whitespace; a sub-slice, no copy
 fn trim_start(s: u8[:]) -> u8[:]
@@ -750,6 +751,7 @@ fn clock() -> f64                                    // monotonic, high resoluti
 fn time_ns() -> i64      fn clock_ns() -> i64
 fn sleep(seconds: f64)   fn sleep_ms(ms: i64)
 fn random_seed() -> u64                              // OS entropy, for rng
+fn random_bytes(out: u8[:]) -> bool                  // OS CSPRNG, for keys and nonces
 ```
 
 Directory listing, subprocesses, sockets and date formatting are not in v1.

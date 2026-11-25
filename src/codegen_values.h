@@ -894,8 +894,11 @@ inline string CodeGen::RzTemp(TypeExpr *t, string &stk) {
     stk = AllocStk(false);
     auto h = T();
     if (IsFrameObj(t)) {
+        // Set before the fixed fields are built, as DeclStackLocal does.
+        auto base = cat(FoTailHdr(t, h), ".base");
         L(CT(t), " ", h, ";");
-        SaveBase(false, stk, cat(FoTailHdr(t, h), ".base"));
+        L(base, " = ", Top(stk), ";");
+        SaveBase(false, stk, base);
     } else {
         L("gs_rhdr ", h, " = { ", Top(stk), ", 0 };");
         SaveBase(false, stk, cat(h, ".base"));
@@ -1566,7 +1569,8 @@ inline void CodeGen::LeafAny(Node *n, const Dst &d) {
         } else if (auto sl = Is<StructLit>(n); sl && d.fresh && d.t && PtrAbi(d.t) &&
                    TEq(d.t, n->exprtype)) {
             // Nothing reads a fresh destination: built there, not in a
-            // temporary copied over (StructLit::CgX).
+            // temporary copied over (StructLit::CgX). Without d.fresh,
+            // fixed_pointer_abi's from_global prints otherwise at -O2.
             if (HasUninitSlots(n->exprtype)) L("GS_MEMZERO(&", d.s, ", sizeof(", d.s, "));");
             StructLitAt(sl, d.s, false);
         } else {

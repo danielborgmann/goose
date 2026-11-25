@@ -567,7 +567,7 @@ inline string CodeGen::HoistAggregateDecls(string &b) {
 // C compiler from fusing a multiply and an add into one rounding in any of
 // them, which the wider instruction sets would otherwise let it do.
 inline void CodeGen::EmitSimdVersions(FnSpec *sp, const string &name, const string &params,
-                                      const string &fnbody) {
+                                      const string &fnbody, vector<string> &names) {
     // The parameter list is `type name` declarations whose types are
     // typedef names or pointers to them; the names forward the call.
     string args;
@@ -588,6 +588,7 @@ inline void CodeGen::EmitSimdVersions(FnSpec *sp, const string &name, const stri
     // it whatever the target's mode (runtime.h).
     for (int lv = SIMD_LEVELS; lv >= 1; lv--) {
         versions[lv] = Unique(cat(name, "_simd", lv));
+        names.push_back(versions[lv]);
         Append(code, "#if GS_SIMD >= ", lv,
                "\n#undef GS_MUL_ADD_MODE\n#define GS_MUL_ADD_MODE fused\nGS_SIMD_TARGET", lv,
                " static ", ret, " ", versions[lv], "(", params, ") {\n", fnbody,
@@ -708,9 +709,15 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
         Append(fnbody, "    uint8_t *", p.second, " = ", gnames[p.first], ".base;\n");
     fnbody += bodyout;
     auto name = er ? ernames[sp] : curinfo->cname;
-    if (sp->sf->issimd) EmitSimdVersions(sp, name, params, fnbody);
-    else Append(code, "static ", FnAttrs(sp), SigRet(sp), " ", name, "(", params, ") {\n", fnbody,
+    // Where the function lies in the C, for MergeSpecs, taken once its
+    // result type is: nothing emitted for that belongs to the function.
+    auto ret = SigRet(sp);
+    SpecText st { sp, er, code.size(), 0, { name } };
+    if (sp->sf->issimd) EmitSimdVersions(sp, name, params, fnbody, st.names);
+    else Append(code, "static ", FnAttrs(sp), ret, " ", name, "(", params, ") {\n", fnbody,
                 "}\n\n");
+    st.end = code.size();
+    spectexts.push_back(std::move(st));
     curspec = nullptr;
     curinfo = nullptr;
     emiter = false;
@@ -979,6 +986,12 @@ inline void CodeGen::InitGlobalStack(VarDef *d) {
 
 inline void CodeGen::EmitProgramInit() {
     Append(data, "static int gs_program_initialized;\n");
+    // What an export's wrapper admits a call on (§7.11): 0 on a thread other
+    // than the one the program started on, 1 there while no Goose code runs,
+    // 2 while Goose code runs on the thread. Only 1 does: the export enters
+    // at gs_sp 0, over stacks whose tops running Goose code may hold in
+    // locals, and on a worker's block it may not even have its stacks.
+    Append(data, "static GS_TLS int gs_entry_state;\n");
     // Every function is emitted by now, so the counts are final: the main
     // program's stacks, and the most regions it and any one worker hold.
     // The worker thunks follow, each opening its program's block.
@@ -1015,7 +1028,7 @@ inline void CodeGen::EmitProgramInit() {
     for (auto &[m, q] : queues) qnames.push_back(q);
     sort(qnames.begin(), qnames.end());
     for (auto &q : qnames) Append(code, "    gs_qinit(&", q, ");\n");
-    Append(code, "    gs_gl = &gs_globals_main;\n    gs_init_globals();\n");
+    Append(code, "    gs_entry_state = 2;\n    gs_gl = &gs_globals_main;\n    gs_init_globals();\n");
     Append(code, "    gs_program_initialized = 1;\n}\n\n");
     // A C host starts the program here: its globals, then fn main() if there
     // is one, which may call the exports and can hold the host's own setup.
@@ -1029,9 +1042,10 @@ inline void CodeGen::EmitProgramInit() {
         Append(code, hostexport, "void goose_init(int argc, char **argv) {\n"
                      "    if (gs_program_initialized) return;\n"
                      "    gs_program_init(argc, argv);\n",
-                     MainCall(), "}\n\n");
+                     MainCall(), "    gs_entry_state = 1;\n}\n\n");
         Append(code, hostexport, "void goose_exit(void) {\n"
                      "    if (!gs_program_initialized) return;\n"
+                     "    gs_entry_state = 0;\n"
                      "    gs_rt_stop();\n"
                      "    free(gs_stks);\n"
                      "    gs_stks = NULL;\n"
@@ -1052,6 +1066,7 @@ inline string CodeGen::MainCall() {
 inline void CodeGen::EmitExports() {
     auto hostexport = sharedlibrary
         ? "#ifdef _WIN32\n__declspec(dllexport)\n#endif\n" : "";
+    auto refusal = false;
     for (auto sf : ast.functions) {
         if (!sf->isexport) continue;
         if (sf->specs.size() != 1 || !sinfo.count(sf->specs[0]))
@@ -1083,25 +1098,44 @@ inline void CodeGen::EmitExports() {
         auto ret = sp->rets.empty() ? string("void")
                    : returnslice ? string("const uint8_t *") : CT(sp->rets[0]);
         Append(exportprotos, ret, " ", sf->cname, "(", params, ");\n");
+        if (!refusal) {
+            refusal = true;
+            Append(code, "static GS_NORETURN void gs_export_refused(const char *reentered) {\n"
+                         "    if (!gs_program_initialized)\n"
+                         "        gs_panic(\"goose_init must be called before exported functions\");\n"
+                         "    if (!gs_entry_state)\n"
+                         "        gs_panic(\"exported functions must be called on the thread the "
+                         "program started on (goose_init's)\");\n"
+                         "    gs_panic(reentered);\n"
+                         "}\n\n");
+        }
         Append(code, hostexport, ret, " ", sf->cname, "(", params, ") {\n"
-                     "    if (!gs_program_initialized)\n"
-                     "        gs_panic(\"goose_init must be called before exported functions\");\n");
+                     "    if (gs_entry_state != 1)\n"
+                     "        gs_export_refused(\"export fn ", sf->name, " was called by C that "
+                     "Goose code called, before it returned; only a C host may call an export, "
+                     "between its calls into Goose\");\n"
+                     "    gs_entry_state = 2;\n");
         if (returnslice) {
             auto value = Unique("gs_export_result");
             Append(code, "    if (!", outlen,
                    ") gs_panic(\"exported slice length pointer is null\");\n");
             Append(code, "    ", CT(sp->rets[0]), " ", value, " = ", si.cname, "(", args,
                    ");\n"
+                   "    gs_entry_state = 1;\n"
                    "    *", outlen, " = ", value, ".len;\n"
                    "    return (const uint8_t *)", value, ".data;\n");
         } else if (sp->rets.empty()) {
-            Append(code, "    ", si.cname, "(", args, ");\n");
+            Append(code, "    ", si.cname, "(", args, ");\n    gs_entry_state = 1;\n");
         } else if (!outres.empty()) {
             Append(code, "    ", CT(sp->rets[0]), " ", outres, ";\n",
                    "    ", si.cname, "(", args, ");\n",
+                   "    gs_entry_state = 1;\n"
                    "    return ", outres, ";\n");
         } else {
-            Append(code, "    return ", si.cname, "(", args, ");\n");
+            auto value = Unique("gs_export_result");
+            Append(code, "    ", CT(sp->rets[0]), " ", value, " = ", si.cname, "(", args, ");\n",
+                   "    gs_entry_state = 1;\n"
+                   "    return ", value, ";\n");
         }
         Append(code, "}\n\n");
     }

@@ -245,7 +245,10 @@ struct TypeEnum : TypeDetail {       // TY_ENUM
 struct TypeName : TypeDetail {       // TY_UNRESOLVED and TY_GENERIC
     int expansionbinding = 0;       // Lexical const-for binding, never a name lookup.
     string_view expansionerror;     // Invalid substitution, diagnosed only when instantiated.
-    string_view name;                // As written: `Name`, `ns::Name` or `::Name`.
+    string_view name;                // `Name`, `ns::Name` or `::Name`: as written, but
+                                     // for a namespace alias, read as its target.
+    string_view written;             // The source text of a qualified name, which an
+                                     // alias makes differ from `name`; empty if not known.
     string_view ns;                  // Where an unqualified name resolves first: the
                                      // namespace of the declaration it was written in
                                      // (docs/design/namespaces.md).
@@ -1539,6 +1542,12 @@ struct SFunction {
     bool isrec = false;         // Declared with `recursive`.
     bool isinline = false;      // Declared with `inline`: inlined whatever its size (§7.13).
     bool issimd = false;        // Declared with `simd`: one version per instruction set (§7.12).
+    // Declared with `deprecated`: a direct call, and a use as a function
+    // value, warns (§7.15). The call through a value already named does not.
+    bool isdeprecated = false;
+    // The string after `deprecated`, empty when the declaration gives none:
+    // the warning's text after the colon.
+    string deprecatemsg;
     // Declared with `checkfree`, or nested in such a function: a bounds
     // check left in any copy of the body is an error (bce.h).
     bool checkfree = false;
@@ -2579,6 +2588,20 @@ struct Ast {
     struct ImportSite { Line line; Line end; string path; };
     vector<ImportSite> imports;
 
+    // Every namespace alias, `namespace name = target;`, with the file that
+    // declares it and where its target is written: the parser rewrites
+    // `name::x` to `target::x` in that file alone, and the driver checks the
+    // targets once every file is parsed (docs/design/namespaces.md).
+    struct NsAlias { int fileidx; string_view name, target; Line targetline; };
+    vector<NsAlias> nsaliases;
+    // The namespace `name` stands for in a file: an alias's target, else
+    // the name itself.
+    string_view ResolveNsAlias(int fileidx, string_view name) const {
+        for (auto &a : nsaliases)
+            if (a.fileidx == fileidx && a.name == name) return a.target;
+        return name;
+    }
+
     // The text the terminal shows for d (RenderDiagnostic), with the source
     // line it is on and a caret under its range.
     string DiagnosticText(const Diagnostic &d) const {
@@ -2621,6 +2644,18 @@ struct Ast {
         if (fileidx < 0 || fileidx >= (int)filepkg.size()) return false;
         auto pkg = filepkg[fileidx];
         return pkg >= 0 && pkg < (int)packages.size() && packages[pkg].stdlib;
+    }
+    // Whether this file is in a package fetched into GOOSE_HOME/pkg, whose
+    // deprecated spellings are its authors' to change, not the program's:
+    // a published version keeps working on older compilers without warning.
+    bool FetchedOrBuiltinFile(int fileidx) const {
+        if (fileidx < 0 || fileidx >= (int)filepkg.size()) return false;
+        auto pkg = filepkg[fileidx];
+        if (pkg < 0 || pkg >= (int)packages.size()) return false;
+        // A package compiled into the compiler was fetched by its build and
+        // is read from there, by path.
+        auto &p = packages[pkg];
+        return !p.cachekey.empty() || p.builtin >= 0;
     }
 
     vector<Node *> allnodes;

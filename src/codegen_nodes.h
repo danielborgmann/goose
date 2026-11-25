@@ -224,11 +224,46 @@ inline string Binary::CgX(CodeGen &cg) {
         auto eq = cg.GenRangeEq(lvw.elem, lvw.elems, lvw.len, rvw.elems, rvw.len);
         return op == T_EQ ? eq : cat("(uint8_t)(!", eq, ")");
     }
-    // Order of evaluation is left-to-right (§2): the left operand lands in
-    // a temp before the right one runs, where the right one can change what
-    // it read (GenOperandVal).
-    auto l = cg.GenOperandVal(left, cg.HasStmts(right));
-    auto r = cg.GenVal(right);
+    // A composite with self-relative fields is not copyable. Equality reads
+    // it in its original storage, as it does a bytes value; save its address
+    // before the right operand runs, not a copy of its relative offsets.
+    string l, r;
+    if ((op == T_EQ || op == T_NEQ) && cg.HasSelfRelRef(lt)) {
+        auto fix = cg.IsFix(lt);
+        auto value = [&](Node *n) {
+            // A spliced reference return can have the context's decayed
+            // exprtype. Receive the reference, not a copy of its pointee.
+            auto ib = Is<InlineBlock>(n);
+            auto rt = ib && ib->spec && ib->spec->rets.size() == 1
+                          ? ib->spec->rets[0] : nullptr;
+            if (rt && IsPlainRef(rt)) {
+                auto p = cg.T();
+                cg.FixedLocal(rt, p);
+                cg.GenAny(n, Dst { DK_LVALUE, p, rt });
+                return fix ? cat("(*", p, ")") : cat("((uint8_t *)", p, ")");
+            }
+            // A call's reference result to a bytes value is its pointer
+            // already (CallVal0); GenVal would construct a copy (GenPtr).
+            auto c = Is<Call>(n);
+            if (!fix && c && c->rettypes.size() == 1 && IsPlainRef(c->rettypes[0]))
+                return cat("((uint8_t *)", cg.GenX(n), ")");
+            return fix ? cg.GenVal(n) : cg.GenPureVal(n);
+        };
+        auto x = value(left);
+        auto p = cg.T();
+        if (fix) {
+            cg.L("const ", cg.CT(lt), " *", p, " = &(", x, ");");
+            l = cat("(*", p, ")");
+        } else {
+            cg.L("uint8_t *", p, " = ", x, ";");
+            l = p;
+        }
+        r = value(right);
+    } else {
+        // Copyable fixed operands are read before later statements (§2).
+        l = cg.GenOperandVal(left, cg.HasStmts(right));
+        r = cg.GenVal(right);
+    }
     if (exprtype && (exprtype->kind == TY_STRUCT || exprtype->kind == TY_ARRAY))
         return cg.GenElemwise(this, l, r);
     auto isint = lt->kind == TY_INT && lt->intstorage != IS_VARINT;
@@ -272,7 +307,7 @@ inline string Dot::CgX(CodeGen &cg) {
         auto vi = ei->en->VariantIndex(variantconst);
         if (et->kind == TY_ENUM && !et->enu->varmode) {
             auto t = cg.T();
-            cg.FixedLocal(et, t);
+            cg.FixedLocal(et, t, cg.HasUninitSlots(et) ? "{0}" : "");
             cg.L(t, ".tag = ", cg.TagConst(ei, vi), ";");
             return t;
         }
@@ -736,6 +771,12 @@ inline void Call::CgAny(CodeGen &cg, const Dst &d) {
         cg.GenAdtAdapted(from, exprtype, d, line, [&](const Dst &nd) { cg.GenCallAs(this, from, nd); });
         return;
     }
+    // A result of another array representation bound for a static-capacity
+    // limited array is copied in under its capacity check, as any other
+    // value is (LeafAny). The checker types a call stored there as the
+    // limited array itself, but a call an inlined body returns keeps its
+    // callee's type, a u8[>..] say, whose result has no lvalue to land in.
+    if (d.k == DK_LVALUE && !d.pool && cg.GenIntoLimited(this, d.t, d.s, true)) return;
     auto rets = cg.EmitCall(this, d);
     // A fixed-value result wires into the lvalue here; a channel-passed one
     // was written in place. A varint-typed one is the i64 it will encode to,
@@ -1023,9 +1064,11 @@ inline void ForLoop::CgStmt(CodeGen &cg) {
         if (auto k = cg.BlockSize(this)) {
             auto lit = r ? Is<IntLit>(r->lo) : nullptr;
             auto fromzero = !r || (lit && !lit->uns && lit->val == 0);
+            auto hilit = Is<IntLit>(r ? r->hi : iter);
+            auto whole = fromzero && hilit && !hilit->uns && hilit->val % k == 0;
             cg.L(ict, " ", ctr, " = ", lov, ";");
             cg.GenBlocked(this, k, cg.AtLeastLeft(ct, hiv, ctr, k, fromzero), step, bind,
-                          cat(ctr, " < ", hiv));
+                          cat(ctr, " < ", hiv), !whole);
             return;
         }
         cg.GenLoopBody(bind, body, d,
@@ -1189,7 +1232,7 @@ inline void ForLoop::CgStmt(CodeGen &cg) {
         if (auto k = cg.BlockSize(this); k && (lenbound < 0 || lenbound >= 2 * k)) {
             cg.L("int64_t ", gi, " = 0;");
             cg.GenBlocked(this, k, cat("(", v.len, ") - ", gi, " >= ", k), cat(gi, "++"), bind,
-                          cat(gi, " < (", v.len, ")"));
+                          cat(gi, " < (", v.len, ")"), !fixedarr || cg.ArrSize(lv.t->arr) % k != 0);
             return;
         }
     }

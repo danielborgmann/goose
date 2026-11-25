@@ -80,6 +80,9 @@ struct Parser {
     // written inside it records as where it resolves first.
     string_view filens;
     string_view curns;
+    // The file's namespace aliases, `namespace name = target;`: a reference
+    // `name::x` is read as `target::x`, in this file alone.
+    unordered_map<string_view, string_view> nsaliases;
     bool declseen = false;           // The directive must come before any declaration.
 
     // Recovery (docs/design/language_server.md §5 D): a statement or a
@@ -103,8 +106,9 @@ struct Parser {
     // the end once more.
     bool eoferror = false;
 
-    Parser(Ast &_ast, string_view filename, const char *source, int _fileidx)
-        : ast(_ast), lex(filename, source, _fileidx), fileidx(_fileidx) {}
+    Parser(Ast &_ast, string_view filename, const string &source, int _fileidx)
+        : ast(_ast), lex(filename, source.c_str(), _fileidx, source.c_str() + source.size()),
+          fileidx(_fileidx) {}
 
     [[noreturn]] void Error(const string &msg) { lex.Error(msg); }
 
@@ -153,7 +157,7 @@ struct Parser {
             case T_DEFER: case T_RETURN: case T_BREAK: case T_CONTINUE:
                 return !declaration;
             default:
-                return AtInline() || AtCheckfree();
+                return AtInline() || AtCheckfree() || AtDeprecated();
         }
     }
 
@@ -316,6 +320,31 @@ struct Parser {
                next == T_EXTERN || next == T_IDENT;
     }
 
+    // The tokens after `deprecated` (and its optional message) are a function
+    // declaration. The lexer copy lives here, not in AtDeprecated: that one
+    // runs at every statement, and a copy in its frame overflows the native
+    // stack on a few thousand nested blocks (the formatter's deep-block check).
+    bool DeprecatedIntro() {
+        auto copy = lex;
+        try {
+            copy.Next();
+            if (copy.tok == T_STRLIT) copy.Next();
+        } catch (CompileError &) {
+            return false;
+        }
+        if (copy.tok == T_FN || copy.tok == T_RECURSIVE || copy.tok == T_THREADFN ||
+            copy.tok == T_SIMD || copy.tok == T_EXTERN || copy.tok == T_EXPORT)
+            return true;
+        return copy.tok == T_IDENT && (copy.attr == "inline" || copy.attr == "checkfree");
+    }
+
+    // `deprecated` likewise, first among a declaration's modifiers, with an
+    // optional message string before the rest (§7.15). A name everywhere else.
+    bool AtDeprecated() {
+        if (lex.tok != T_IDENT || lex.attr != "deprecated") return false;
+        return DeprecatedIntro();
+    }
+
     void Expect(TType t, const char *context) {
         if (lex.tok != t)
             Error(cat("expected \'", TName(t), "\' in ", context, ", found \'", TokStr(), "\'"));
@@ -359,11 +388,26 @@ struct Parser {
 
     // A reference to a declaration: `name`, `ns::name`, or `::name`. The
     // qualified spellings are interned as one string (Ident::name).
-    string_view ParseQualifiedName(const char *context) {
-        if (IsNext(T_COLONCOLON)) return ast.Intern(cat("::", ExpectIdent(context)));
+    // A qualifier that is one of the file's aliases is replaced by its
+    // target, so nothing past the parser sees the alias. `written`, where
+    // given, is set to the source text of the name, for diagnostics.
+    string_view ParseQualifiedName(const char *context, string_view *written = nullptr) {
+        auto start = lex.attr.data();
+        auto spelled = [&](string_view leaf) {
+            if (written) *written = string_view(start, (size_t)(leaf.data() + leaf.size() - start));
+        };
+        if (IsNext(T_COLONCOLON)) {
+            auto leaf = ExpectIdent(context);
+            spelled(leaf);
+            return ast.Intern(cat("::", leaf));
+        }
         auto name = ExpectIdent(context);
+        spelled(name);
         if (!IsNext(T_COLONCOLON)) return name;
-        return ast.Intern(cat(name, "::", ExpectIdent(context)));
+        if (auto it = nsaliases.find(name); it != nsaliases.end()) name = it->second;
+        auto leaf = ExpectIdent(context);
+        spelled(leaf);
+        return ast.Intern(cat(name, "::", leaf));
     }
 
     string_view ParseStorageName(const char *context) {
@@ -377,6 +421,10 @@ struct Parser {
     // how a dump carries every file's namespace in one file. The rest of
     // the declaration is then parsed as written in that namespace.
     string_view ParseDeclName(const char *context) {
+        if (lex.tok == T_IDENT && lex.PeekTok() == T_COLONCOLON)
+            if (auto it = nsaliases.find(lex.attr); it != nsaliases.end())
+                Error(cat("a declaration names its namespace, not an alias: ", lex.attr,
+                          " is an alias of ", it->second));
         auto name = lex.tok == T_COLONCOLON ? string_view {} : ExpectIdent(context);
         if (IsNext(T_COLONCOLON)) {
             curns = name;
@@ -427,12 +475,45 @@ struct Parser {
         switch (lex.tok) {
             case T_NAMESPACE: {
                 // `namespace name;`: at most once, ahead of the declarations
-                // (imports may come either side of it).
+                // (imports may come either side of it). `namespace name =
+                // target;` is an alias instead, also ahead of them, so it is
+                // in place before any reference it rewrites.
                 lex.Next();
+                if (lex.tok == T_IDENT && lex.PeekTok() == T_ASSIGN) {
+                    // Each check runs while its name is the current token,
+                    // which is where the error is placed. One that comes
+                    // too late is still an alias, reported and kept, so
+                    // that each use of it is not an error of its own.
+                    if (declseen)
+                        ast.Report(lex.Diagnose("a namespace alias must precede all declarations",
+                                                lex.tokline, lex.toklinestart));
+                    auto name = lex.attr;
+                    if (nsaliases.count(name)) Error(cat("namespace alias ", name, " declared twice in this file"));
+                    if (name == filens) Error(cat("namespace alias ", name, " is this file's own namespace"));
+                    lex.Next();
+                    Expect(T_ASSIGN, "namespace alias");
+                    if (lex.tok == T_IDENT) {
+                        if (lex.attr == name) Error(cat("namespace alias ", name, " names itself"));
+                        if (auto it = nsaliases.find(lex.attr); it != nsaliases.end())
+                            Error(cat("a namespace alias names a namespace, not an alias: ", lex.attr,
+                                      " is an alias of ", it->second));
+                    }
+                    auto targetline = CurLine();
+                    auto target = ExpectIdent("namespace alias");
+                    Expect(T_SEMI, "namespace alias");
+                    nsaliases[name] = target;
+                    ast.nsaliases.push_back({ fileidx, name, target, targetline });
+                    return;
+                }
                 if (!filens.empty()) Error("namespace declared twice in this file");
                 if (declseen) Error("the namespace declaration must precede all declarations");
+                if (lex.tok == T_IDENT && nsaliases.count(lex.attr))
+                    Error(cat("namespace ", lex.attr, " is an alias in this file"));
                 filens = ExpectIdent("namespace declaration");
                 Expect(T_SEMI, "namespace declaration");
+                // The namespace exists from here, declarations or not, so an
+                // alias in another file may name it.
+                ast.NS(filens);
                 curns = filens;
                 return;
             }
@@ -467,7 +548,7 @@ struct Parser {
             ParseStructDecl(true);
             return;
         }
-        if (AtInline() || AtCheckfree()) goto fndecl;
+        if (AtInline() || AtCheckfree() || AtDeprecated()) goto fndecl;
         switch (lex.tok) {
             case T_STRUCT: ParseStructDecl(); return;
             case T_ENUM:   ParseEnumDecl();   return;
@@ -673,17 +754,8 @@ struct Parser {
         ast.topdecls.push_back(Finish(New<EnumDecl>(line, en)));
     }
 
-    // Whether this file is a package fetched into GOOSE_HOME/pkg, whose
-    // deprecated spellings are its authors' to change, not the program's:
-    // a published version keeps working on older compilers without warning.
     bool InFetchedPackage() const {
-        if (fileidx < 0 || fileidx >= (int)ast.filepkg.size()) return false;
-        auto pkg = ast.filepkg[fileidx];
-        if (pkg < 0 || pkg >= (int)ast.packages.size()) return false;
-        // A package compiled into the compiler was fetched by its build and
-        // is read from there, by path.
-        auto &p = ast.packages[pkg];
-        return !p.cachekey.empty() || p.builtin >= 0;
+        return ast.FetchedOrBuiltinFile(fileidx);
     }
 
     // An `extern` a caller consumed before ParseFnDecl, with its string: a
@@ -746,6 +818,14 @@ struct Parser {
         // for the `= "sym"` after it, and warned of once the name is known.
         auto oldcname = pre && !inblock && !pre->cname.empty();
         auto oldline = line;
+        if (AtDeprecated()) {
+            sf->isdeprecated = true;
+            lex.Next();
+            if (lex.tok == T_STRLIT) {
+                sf->deprecatemsg = lex.sval;
+                lex.Next();
+            }
+        }
         auto checkfree = false;
         if (AtCheckfree()) {
             checkfree = true;
@@ -1148,7 +1228,9 @@ struct Parser {
         }
         switch (lex.tok) {
             case T_IDENT: case T_COLONCOLON: {
-                auto t = NewUnresolvedType(ParseQualifiedName("type"), line);
+                string_view written;
+                auto t = NewUnresolvedType(ParseQualifiedName("type", &written), line);
+                t->named->written = written;
                 if (lex.tok == T_LT) Role(R_ANGLE_OPEN);
                 if (IsNext(T_LT)) {
                     for (;;) {
@@ -2082,7 +2164,7 @@ struct Parser {
     // One statement of b, or its tail; returns false once the block has
     // ended (its `}` consumed, by a guard's rest of the block included).
     bool ParseStatement(Block *b) {
-        if (AtInline() || AtCheckfree()) goto nestedfndecl;
+        if (AtInline() || AtCheckfree() || AtDeprecated()) goto nestedfndecl;
         if (AtPar()) {
             b->stmts.push_back(ParsePar());
             return true;
@@ -2185,7 +2267,10 @@ struct Parser {
                 case T_FN: case T_RECURSIVE: case T_THREADFN: case T_EXTERN: case T_EXPORT:
                 case T_SIMD:
                     Error(cat("defer takes a statement or a block, not `", TokStr(), "`"));
-                default: break;
+                default:
+                    if (AtDeprecated())
+                        Error(cat("defer takes a statement or a block, not `", TokStr(), "`"));
+                    break;
             }
             body = New<Block>(line);
             stmt_ended = false;

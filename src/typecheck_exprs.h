@@ -153,13 +153,19 @@ inline void TypeCheck::NoTemporaryLiteral(Node *n, TypeExpr *t) {
                  "for a slice or reference to view; bind it to a variable first"));
 }
 
+inline void TypeCheck::OptionalDerefError(Node *receiver, Node *at) {
+    if (Is<Dot>(receiver) || Is<Index>(receiver))
+        Error(at, cat("only variables can be narrowed: bind `", ExprStr(receiver),
+                      "` to a local with `.=` and test the local before use"));
+    Error(at, "optional value must be narrowed (if/guard/assert) before use");
+}
+
 // Crossing a reference in a path (auto-deref, §3.8): the storage owner
 // becomes the reference's root, writability its provenance, and the rest of
 // the path lies in its pointee (Prov::reached).
 inline void TypeCheck::DerefLValue(LVal &lv, Node *at) {
     if (lv.type->kind != TY_REF) return;
-    if (lv.type->ref->optional)
-        Error(at, "optional value must be narrowed (if/guard/assert) before use");
+    if (lv.type->ref->optional) OptionalDerefError(at, at);
     // Reading a reference variable requires it to have a value.
     if (lv.var) {
         RequireAssigned(lv.var, at);
@@ -1712,7 +1718,7 @@ inline TypeExpr *TypeCheck::UnifyNumeric(Node *at, TType op, Val &lv, Val &rv, T
             return ast.inttypes[IS_I64];
         }
         auto fits = [&](const Val &c, TypeExpr *t) {
-            return c.flexint ? FlexFits(c, t->intstorage)
+            return c.flexint || c.notconst ? FlexFits(c, t->intstorage)
                    : c.litint ? ConstsFit(c, t->intstorage)
                               : FitsIntStorage(c.ival, c.uns, t->intstorage);
         };

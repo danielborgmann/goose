@@ -8,6 +8,37 @@
 
 namespace goose {
 
+// A `deprecated` function (§7.15). The warning names it, and repeats the
+// declaration's string when it has one: `copy_into is deprecated: use copy_from`.
+inline void WarnDeprecatedFn(TypeCheck &tc, Node *at, SFunction *sf) {
+    if (!sf || !sf->isdeprecated) return;
+    if (at && tc.ast.FetchedOrBuiltinFile(at->line.fileidx)) return;
+    auto msg = cat(sf->name, " is deprecated");
+    if (!sf->deprecatemsg.empty()) Append(msg, ": ", sf->deprecatemsg);
+    tc.Warn(at, msg);
+}
+
+// A direct call, `f(...)` or `a.f(...)`, of one. A call through a function
+// value warns where that value is named (WarnDeprecatedValue), not here:
+// the callee's name is the variable's, not the function's.
+inline void WarnDeprecatedCall(TypeCheck &tc, Call *c, string_view name, SFunction *sf) {
+    if (!sf || !sf->isdeprecated) return;
+    auto direct = false;
+    if (auto id = Is<Ident>(c->callee)) direct = id->name == name;
+    else if (Is<Dot>(c->callee)) direct = true;
+    if (direct) WarnDeprecatedFn(tc, c, sf);
+}
+
+// Naming a deprecated function as a value. A set warns only when every
+// overload is deprecated, so a live overload of the same name stays quiet
+// until a call selects the deprecated one.
+inline void WarnDeprecatedValue(TypeCheck &tc, Node *at, const vector<SFunction *> &fns) {
+    if (fns.empty()) return;
+    for (auto sf : fns)
+        if (!sf->isdeprecated) return;
+    WarnDeprecatedFn(tc, at, fns[0]);
+}
+
 // ------------------------------------------------------------------
 // Calls: builtin members, builtins, UFCS, overload resolution with
 // generic inference (§7.1, §7.7), and case-function tag dispatch (§8.2).
@@ -478,6 +509,7 @@ inline Val TypeCheck::ResolveCall(Call *c, vector<SFunction *> &cands, FnSpec *e
     c->spec = spec;
     CheckCalleeRelative(c, spec, argvals);
     CalleesReturn({ spec }, argsreach);
+    WarnDeprecatedCall(*this, c, name, best.sf);
     return CallResult(c, spec, argvals);
 }
 
@@ -1144,7 +1176,12 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
     // once, before the tag picks the case, so the cases get every argument
     // written, and none of their defaults (§8.2): only `defaults` tries
     // with them, to say so. A case converting an integer argument to a
-    // float counts only where no other matches (ResolveCall).
+    // float counts only where no other matches (ResolveCall). A case takes
+    // the variant, or a reference to it: an overload taking the whole ADT
+    // at pos is an ordinary candidate, which the variant reaches only by
+    // converting back to the ADT, and a case of it would be handed the
+    // payload where it takes the ADT. It gets the call where dispatch does
+    // not, as the integer-to-float last resort among them (ResolveCall).
     auto dispatches = [&](vector<Val> &vals, size_t pos, TypeExpr *et, bool isref,
                           bool defaults, vector<MatchInfo> &vm) {
         for (auto &var : et->enu->en->variants) {
@@ -1159,6 +1196,8 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
                 mi.env = env;
                 string why;
                 if (!TryMatch(sf, c, vals, mi, why, defaults)) continue;
+                auto pt = mi.paramtypes[pos];
+                if ((pt->kind == TY_REF ? pt->ref->sub : pt)->kind != TY_VARIANT) continue;
                 if (mi.tier == MatchInfo::INTTOFLOAT) {
                     onlyconverting = mi;
                     converting++;
@@ -1341,6 +1380,7 @@ inline Val TypeCheck::TryDispatch(Call *c, vector<SFunction *> &cands, FnSpec *e
         }
     }
     lastcallrets = results;
+    for (auto &mi : matches) WarnDeprecatedCall(*this, c, name, mi.sf);
     return results.empty() ? VoidVal() : results[0];
 }
 
@@ -2770,9 +2810,17 @@ inline void TypeCheck::CheckExport(SFunction *sf) {
     // The symbol is emitted as written, so a C host can ask for a name; a
     // keyword is refused here rather than left to a C compiler's error.
     if (IsCKeyword(sf->cname)) fail("C symbol cannot be a C keyword");
-    for (auto other : ast.functions)
+    for (auto other : ast.functions) {
         if (other != sf && other->isexport && other->cname == sf->cname)
             fail(cat("C symbol ", sf->cname, " is exported more than once"));
+        // The wrapper runs the export on the stacks of whatever Goose code is
+        // running, whose tops that code may still hold in locals; only a C
+        // host may call it, between its calls into Goose (§7.11).
+        if (other->isextern && other->dylib.empty() && other->cname == sf->cname)
+            Error(other->line, cat("extern fn ", other->name, " is the C symbol of export fn ",
+                                   sf->name, ": call ", sf->name,
+                                   " directly; only a C host may call an export (§7.11)"));
+    }
     for (auto &p : sf->params) {
         if (!p.type) fail(cat("parameter ", p.name, " needs a type"));
         if (p.defaultval) fail(cat("parameter ", p.name, " cannot have a default"));

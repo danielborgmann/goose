@@ -1127,6 +1127,7 @@ class Runner:
             "shape_strip_fixed": f"{strip} 4", "shape_strip_div": f"{strip} 4",
             "shape_sum_dot": sums, "shape_sum_count": sums, "shape_sum_f32": sums,
             "shape_sum_range": sums, "shape_sum_spec": sums, "keep_sum_reads": None,
+            "shape_sum_whole": sums, "shape_sum_ragged": sums, "shape_sum_fixed": sums,
             "shape_bound_count": f"{bound} 8", "shape_bound_any": f"{bound} 8",
             "shape_bound_all": f"{bound} 8", "shape_bound_for": f"{bound} 6",
             "shape_bound_grow": f"{bound} 8",
@@ -1148,6 +1149,19 @@ class Runner:
         if "gs_divu32_q(" not in body or re.search(r"\bgs_(?:div|mod)_u32\(", body):
             self.fail("loop shapes shape_strip_div", "a division not by the divisor's magic number")
             valid = False
+        # From 0 to a constant multiple of the block size, the blocks run every
+        # iteration and there is no loop for the rest (CodeGen::GenBlocked,
+        # #210); any other count, constant or not, keeps it.
+        tails = {
+            "shape_sum_whole": False, "shape_sum_fixed": False, "shape_sum_ragged": True,
+            "shape_sum_count": True, "shape_sum_dot": True, "shape_strip_fixed": True,
+        }
+        for name, want in tails.items():
+            got = bool(re.search(r"^\s*for \(; ", texts.get(name, ""), re.MULTILINE))
+            if got != want:
+                self.fail(f"loop shapes {name}",
+                          f"loop for the rest: got {got}, want {want}")
+                valid = False
         # A && or || condition is a chain of branches (CodeGen::GenBranch):
         # neither the 0/1 flag the right operand sets inside an `if`, which
         # a value keeps, nor the two flags combined with & or | of a loop that
@@ -1820,6 +1834,56 @@ def main():
         else:
             r.ok(f"last-use moves {f.name}")
     r.show_task(last_use_moves)
+    # Specializations whose C is the same but for the names of the functions
+    # they call and the numbers of their long-distance returns are written
+    # once (CodeGen::MergeSpecs): every function of the fixture but main and
+    # triple is specialized twice (--specs), and has one C function, at -O0,
+    # which inlines nothing, but for mapped, whose copies differ in a
+    # constant and keep two. total's copies call triple, specialized once,
+    # whose name stays in their text. ignore and discard, two functions
+    # whose C is the same (checked, so that this is not vacuous), keep one
+    # each, as only copies of one function merge. Each target number thrown
+    # is one that a kept target catches, and only the kept targets' channels
+    # are declared.
+    def merged_specs():
+        f = HERE / "codegen" / "merged_specs.goose"
+        cfile = gendir / "merged_specs-merged.c"
+        code, out, err = r.goose("-O0", "--specs", "-o", cfile, f)
+        if code != 0:
+            r.fail(f"merged specs {f.name}", out + err)
+            return
+        text = cfile.read_text()
+        names = ["total", "ping", "pong", "reject", "check", "scan", "outer", "inner", "leaf",
+                 "wide_sum", "doubled", "ignore", "discard"]
+        specs = re.findall(r"^// spec \d+:[^\n]*\nfn (\w+)\(", out, re.MULTILINE)
+        wrong = [f"{n}: {specs.count(n)} specializations, want {want}"
+                 for n, want in [(n, 2) for n in names + ["mapped"]] + [("triple", 1)]
+                 if specs.count(n) != want]
+        for n, er, want in ([(n, "", 1) for n in names + ["triple"]] +
+                            [("doubled", "_er", 1), ("mapped", "", 2)]):
+            defs = re.findall(rf"^static [^\n;]*\b{n}_g(?:_\d+)?{er}\([^\n]*\) \{{$",
+                              text, re.MULTILINE)
+            if len(defs) != want:
+                wrong.append(f"{n}{er}: {len(defs)} C functions, want {want}")
+        # A function's parameters and body, without its name.
+        def body(n):
+            m = re.search(rf"^static [^\n;]*\b{n}_g(?:_\d+)?(\([^\n]*\) \{{\n.*?^\}})$",
+                          text, re.MULTILINE | re.DOTALL)
+            return m.group(1) if m else None
+        if body("ignore") is None or body("ignore") != body("discard"):
+            wrong.append("ignore and discard: not the same C, so keeping them apart tests nothing")
+        caught = re.findall(r"\bgs_rf == (\d+)\)", text)
+        thrown = set(re.findall(r"\bgs_rf = ([1-9]\d*);", text))
+        declared = set(re.findall(r"^static GS_TLS [^\n]*\bgs_lret_(\d+)_0;$", text, re.MULTILINE))
+        if len(caught) != 3 or len(set(caught)) != 3:
+            wrong.append(f"targets caught: {caught}, want 3 distinct")
+        if not thrown or not thrown <= set(caught) or declared != set(caught):
+            wrong.append(f"thrown {sorted(thrown)}, caught {caught}, declared {sorted(declared)}")
+        if wrong:
+            r.fail(f"merged specs {f.name}", ", ".join(wrong))
+        else:
+            r.ok(f"merged specs {f.name}")
+    r.show_task(merged_specs)
     # Root descriptors expose ordinary component metadata to top caching and
     # loop-view hoisting, even when Goose leaves the helper out of line.
     def root_owner_caches():
@@ -2086,30 +2150,38 @@ def main():
         r.show_task(runtime_lifecycle, "runtime_threads_lifecycle", "threads")
         r.show_task(runtime_lifecycle, "runtime_trim_memory", "runtime")
 
-        # A library build's C host: goose_exit ends the program and goose_init
-        # starts it again over fresh globals and queues, and ending it while a
-        # worker still runs is a runtime error.
-        def host_exit():
-            src = HERE / "threads" / "host_exit.goose"
-            cfile = gendir / "host_exit.c"
-            code, out, err = r.goose("-O1", "--header", gendir / "host_exit.h", "-o", cfile, src)
+        # Library builds' C hosts, each built with the C the compiler writes for
+        # its program (--header). host_exit's ends the program with goose_exit
+        # and starts it again over fresh globals and queues, and ending it
+        # while a worker still runs is a runtime error. export's and
+        # bce_export_entry's call the exports' wrappers, which only a C host
+        # may (§7.11).
+        def host_program(sub, stem, hostc, runs):
+            src = HERE / sub / f"{stem}.goose"
+            cfile = gendir / f"{stem}.c"
+            code, out, err = r.goose("-O1", "--header", gendir / f"{stem}.h", "-o", cfile, src)
             if code != 0:
-                r.fail("host-exit cgen host_exit.goose", out + err)
+                r.fail(f"host cgen {stem}.goose", out + err)
                 return
             # Beside the header it includes.
-            host = gendir / "host_exit_main.c"
-            shutil.copyfile(HERE / "threads" / "host_exit.c", host)
-            out_exe = gendir / f"host_exit{tc.EXE_SUFFIX}"
+            host = gendir / f"{stem}_main.c"
+            shutil.copyfile(HERE / sub / hostc, host)
+            out_exe = gendir / f"{stem}{tc.EXE_SUFFIX}"
             ok, log = cc.compile([host, cfile], out_exe, opt=1, extra=extra, strict_decls=True,
-                                 runtime=r.runtime, log=gendir / "host_exit.cc.log")
+                                 runtime=r.runtime, log=gendir / f"{stem}.cc.log")
             if not ok:
-                r.fail("host-exit cc host_exit", "\n".join(log.splitlines()[:8]))
+                r.fail(f"host cc {stem}", "\n".join(log.splitlines()[:8]))
                 return
-            for name, argv in (("host_exit_c", []), ("host_exit_live", ["live"])):
+            for name, argv in runs:
                 out = r.run_expected([out_exe] + argv, name, name)
                 if out is not None and r.check_stdout(name, name, out):
                     r.ok(f"host {name}")
-        r.show_task(host_exit)
+        r.show_task(host_program, "threads", "host_exit", "host_exit.c",
+                    (("host_exit_c", []), ("host_exit_live", ["live"])))
+        r.show_task(host_program, "codegen", "export", "export_host.c",
+                    (("export_host", []), ("export_host_early", ["early"])))
+        r.show_task(host_program, "optimizer", "bce_export_entry", "bce_export_entry_host.c",
+                    (("bce_export_entry_host", []),))
 
         # FastGoose's par for (tools/par_for.md): each program forks, and
         # prints its expected output on one thread and on the pool.
@@ -2397,12 +2469,14 @@ def main():
                 script = gendir / f"completion.{shell}"
                 tc.write_text(script, out)
                 if shell == "bash":
-                    tc.write_text(gendir / "complete_me.goose", "fn main() {}\n")
+                    probe_dir = gendir / "completion_probe"
+                    probe_dir.mkdir(parents=True, exist_ok=True)
+                    tc.write_text(probe_dir / "complete_me.goose", "fn main() {}\n")
                     probe_sh = (f"source '{script}'; t() {{ COMP_WORDS=(\"$@\"); "
                                 "COMP_CWORD=$(( ${#COMP_WORDS[@]} - 1 )); COMPREPLY=(); _goose; "
                                 "echo \"${COMPREPLY[*]}\"; }; t goose bu; t goose build --dr; t goose complete_m")
                     r2 = subprocess.run(["bash", "-c", probe_sh], capture_output=True, text=True,
-                                        cwd=gendir)
+                                        cwd=probe_dir)
                     lines = r2.stdout.splitlines()
                     checks.append(("completion bash, run", lines == ["build", "--dry-run", "complete_me.goose"],
                                    r2.stdout + r2.stderr))
@@ -2674,6 +2748,17 @@ def main():
             r.fail("deep expressions", str(e))
     r.show_task(deep_expressions)
 
+    def copy_elision():
+        from copy_elision import check_copy_elision
+        try:
+            n = check_copy_elision(exe, cc, gendir)
+            r.ok(f"copy elision: {n} generated programs print the same at -O0 and -O2, with "
+                 "the copies of fixed structs over 256 bytes left out and with "
+                 "--no-copy-elision" + (", built" if cc else ", run"))
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            r.fail("copy elision", str(e))
+    r.show_task(copy_elision)
+
     def diagnostics_json():
         from diagnostics_json import check_diagnostics_json
         try:
@@ -2776,7 +2861,7 @@ def main():
                 r.say(f"skip packages from git ({skipped})")
             else:
                 r.ok("packages from git: concurrent fetches, submodules, interrupted fetch, "
-                     "tag, commit, update, differing ref, offline")
+                     "tag, commit, update, differing ref, offline, cache path")
         except RuntimeError as e:
             r.fail("packages from git", str(e))
     r.show_task(git_packages)

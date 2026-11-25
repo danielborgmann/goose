@@ -89,7 +89,7 @@ The library uses these conventions:
   `heap_push`) cannot take one that contains self-relative references, because
   those values cannot be copied (spec §3.9). Construct them in place.
 * The functions that move elements around (`swap_at`, `reverse`, `shuffle`,
-  `sort`, `stable_sort`, `fill`, `copy_into`, `insert_at`, `remove_at`,
+  `sort`, `stable_sort`, `fill`, `copy_from`, `insert_at`, `remove_at`,
   `swap_remove`, `retain`, `dedup`, the heap functions) move the elements
   themselves, including references: `reverse(refs)` reorders an array of
   references and leaves what they point to unchanged, and an array of
@@ -248,7 +248,7 @@ results.
 
 ```goose
 fn each_rev<T, F>(xs: T[:])                    // F(x), last to first
-fn each_chunk<T, F>(xs: T[:], n: i64)          // F(chunk: T[:], i); the last chunk may be short
+fn each_chunk<T, F>(xs: T[:], n: i64)          // F(chunk: T[:], i); asserts n > 0; last chunk may be short
 fn chunk<T>(xs: T[:], k: i64, n: i64) -> T[:]  // k-th of n runs covering xs, lengths within one
 fn chunk_at<T>(xs: T[:], bounds: const i64[:], k: i64) -> T[:]
                                                 // xs[bounds[k]..bounds[k + 1]]
@@ -302,9 +302,12 @@ fn find_pair(s: u8[:], a: const ByteSet&, d: i64, b: const ByteSet&) -> i64
 These functions scan in the runtime. On x86-64 they test 16 bytes at a time
 with SSE2, which every such CPU has. A set that is not at most three bytes,
 one range, or the complement of either is looked up in nibble tables, which
-needs SSSE3; the runtime checks for it when the program starts. Elsewhere,
-and in a JIT run, they test one byte at a time, and a set of a single byte
-is searched with the C library's `memchr`. `byte_set` works out how to test
+needs SSSE3; the runtime checks for it when the program starts. On AArch64
+(little-endian, built with clang or gcc) they use NEON, which every such CPU
+has, for every kind of set, and `find_any` tests 64 bytes at a time where
+the search is that long. Elsewhere, and in a JIT run, they test one byte at
+a time, and a set of a single byte is searched with the C library's
+`memchr`. `byte_set` works out how to test
 a set by going over all 256 bytes, so make the set once, in a variable,
 outside the loop that searches. `members` is the set, and the other fields
 are used by the search. `find_pair` is the test for a prefilter that knows
@@ -343,7 +346,8 @@ let total = fold(xs, 0.0) { a, x => a + x };
 
 ```goose
 fn fill<T>(xs: T[:], v: T)
-fn copy_into<T>(dst: T[:], src: T[:])           // equal lengths; first to last
+fn copy_from<T>(dst: T[:], src: T[:])           // equal lengths; first to last
+fn copy_into<T>(dst: T[:], src: T[:])           // deprecated name of copy_from; a call warns
 fn reverse<T>(xs: T[:])
 fn sort<T>(xs: T[:])                            // by <; sort(xs) { a, b => ... } by the block
 fn stable_sort<T>(xs: T[:])                     // natural merge sort; one temporary of xs.len elements
@@ -351,9 +355,13 @@ fn to_lower(s: u8[:])                           // ASCII, in place
 fn to_upper(s: u8[:])
 ```
 
-`copy_into` preserves its element-by-element, first-to-last semantics. For a
-checked copy that preserves the source values when the slices overlap, use the
-language operation `dst.move_from(src)` (fixed-size, copyable elements).
+`copy_from` preserves its element-by-element, first-to-last semantics.
+`dst.copy_from(src)` reads the same way the call behaves: it copies from
+`src` into `dst`. `copy_into` is that function under its old name. The
+arguments are unchanged, and a call warns (spec §7.15) and names
+`copy_from`. For a checked copy that preserves the source values when the
+slices overlap, use the language operation `dst.move_from(src)` (fixed-size,
+copyable elements).
 
 `sort` is a pattern-defeating quicksort based on pdqsort and Rust's
 ipnsort. It is unstable (the order it leaves equal elements in is
@@ -421,9 +429,9 @@ fn format_uint<B>(out: B&, v: u64, base: i64, width: i64, padc: u8)   // B: u8[>
 fn format_flt(out: u8[>..]&, v: f64, decimals: i64)        // fixed decimals, the exact value rounded half up; inf/-inf/nan as print writes them
 fn parse_int(s: u8[:], base: i64 = 10) -> i64, bool        // optional sign, whole string; false outside i64 or base 2..36
 fn parse_uint(s: u8[:], base: i64 = 10) -> u64, bool       // optional '+', whole string; false on '-' or outside u64 or base 2..36
-fn parse_flt(s: u8[:]) -> f64, bool                        // sign, fraction, exponent; correctly rounded
+fn parse_flt(s: u8[:]) -> f64, bool                        // sign, fraction, exponent, or inf/-inf/nan; correctly rounded
 fn format_uleb(out: u8[>..]&, v: i64)                     // LEB128 (3.6), 1-10 bytes
-fn parse_uleb(s: u8[:]) -> i64, i64                       // value and byte count; 0, 0 if malformed
+fn parse_uleb(s: u8[:]) -> i64, i64                       // value and byte count; 0, 0 if malformed or not shortest
 fn compare(a: u8[:], b: u8[:]) -> i64                      // bytewise: -1, 0, 1
 fn trim(s: u8[:]) -> u8[:]                                 // ASCII whitespace; a sub-slice
 fn trim_start(s: u8[:]) -> u8[:]                           fn trim_end(s: u8[:]) -> u8[:]
@@ -450,11 +458,11 @@ strings; the functions here add control over the output, and parsing. In
 base 10, `format_int` and `format_uint` write the same text as `format`
 (after any padding) and run as fast. `format_int` and `format_uint` abort
 when `base` is outside 2..36; `parse_int` and `parse_uint` return `false`
-for such a base. `parse_flt` gives the double nearest to
-the decimal, as C's `strtod` does, so a float's text from `print` or
-`format` reads back as the same value. Strings are `u8` arrays: input is a
-`u8[:]`, output goes to a `u8[>..]&` builder, and storage is a `u8[]` or
-`u8[..k]`.
+for such a base. `parse_flt` gives the double nearest to the decimal, as C's
+`strtod` does, so a float's text from `print` or `format` reads back as the
+same value, including the `inf`, `-inf` and `nan` they write for the
+non-finite values. Strings are `u8` arrays: input is a `u8[:]`, output goes
+to a `u8[>..]&` builder, and storage is a `u8[]` or `u8[..k]`.
 
 `split_once` cuts s at the first sep, as Go's `strings.Cut` does: the part
 before and the part after, read-only slices into s, and `true`. When sep is
@@ -1156,6 +1164,7 @@ fn clock() -> f64                                    // monotonic, high resoluti
 fn time_ns() -> i64         fn clock_ns() -> i64
 fn sleep(seconds: f64)      fn sleep_ms(ms: i64)
 fn random_seed() -> u64                              // entropy, for rng
+fn random_bytes(out: u8[:]) -> bool                  // cryptographic; false: the OS gave none
 ```
 
 `trim_memory` asks the OS to discard complete pages beyond every current
@@ -1183,6 +1192,16 @@ path is refused, and the call returns `false`, if it is longer than 4095
 bytes, contains a NUL byte, or (on Windows) is not valid UTF-8, because a
 path that was cut short or decoded another way could name a different
 file.
+
+`random_bytes` fills its argument from the operating system's
+cryptographically secure generator, for keys, nonces and other secrets:
+`getentropy` on macOS, Linux and the BSDs (`/dev/urandom` where the kernel
+lacks it), and `ProcessPrng` on Windows 10 and later (`RtlGenRandom` before
+that), looked up at run time so that a program links no further library.
+`false` means the OS gave no bytes; the contents of `out` are then not to be
+used. `random_seed` takes its value the same way, and falls back to a mix of
+the clocks only if that fails, so it is not for secrets. `std`'s `rng` is
+never for secrets.
 
 `read_file` appends nothing when it fails. `read_stdin` appends the bytes
 unchanged, on Windows too, where the C library's text mode would turn each
@@ -1780,7 +1799,7 @@ read-write resources are instead passed to `begin_compute` in binding order.
 fn open(title: const u8[:], width: i64, height: i64) -> bool        // and (..., flags)
 fn open_headless(width: i64, height: i64) -> bool                   // no window; and (..., flags)
 fn close()
-fn frame() -> bool          // ends the frame drawn since the last call; false once asked to close
+fn frame() -> bool          // ends the frame drawn since the last call; false once asked to close or the device is lost
 fn quit()                   // frame() returns false next
 fn flush()                  // submit everything and wait for the GPU
 fn error() -> u8[>..]       // why the last failing call failed
@@ -1791,17 +1810,22 @@ fn set_fullscreen(on: bool) -> bool   fn fullscreen() -> bool   fn maximize()
 fn screen() -> Texture      fn screen_depth() -> Texture      fn screen_size() -> int2
 fn pixel_density() -> f32   fn display_scale() -> f32
 fn time() -> f64            fn delta_time() -> f64            fn frame_count() -> i64
+fn native_window() -> u64   fn native_display() -> u64        fn native_kind() -> i64
+fn presented(shown: bool)   fn needs_present() -> bool        // WINDOW_ONLY
 ```
 
 Flags for `open`: `WINDOW_RESIZABLE`, `WINDOW_HIDDEN`, `WINDOW_FULLSCREEN`,
 `NO_VSYNC`, `DEBUG` (validation layers where installed; on in a debug build of
-the layer). With `GOOSE_GFX_HEADLESS=1` in the environment, `open` opens no
-window; the test runners use this. The screen is an RGBA8 texture the size
-of the window in pixels, with a depth texture. A frame draws into it, and
-`frame()` shows it. A window has the width and height that `open` gives, in
-the display's own coordinates, and it has every pixel the display has in
-that area. On a high-density display, that is more pixels than its width
-and height; `screen_size()` counts these pixels, and the mouse position is
+the layer), `WAIT_WHEN_IDLE` and `WINDOW_ONLY` (below). With
+`GOOSE_GFX_HEADLESS=1` in the environment, `open` opens no window; the test
+runners use this. The screen is an RGBA8 texture the size of the window in
+pixels. Its depth texture is made on the first `screen_depth()`, which
+`begin_screen` calls; a 2D program that needs no depth draws with
+`begin_pass(screen(), Texture { 0 }, clear)`. A frame draws into the screen,
+and `frame()` shows it. A window has the width and height that `open` gives,
+in the display's own coordinates, and it has every pixel the display has in
+that area. On a high-density display, that is more pixels than its width and
+height; `screen_size()` counts these pixels, and the mouse position is
 reported in them.
 
 `pixel_density()` is the screen's pixels per unit of those coordinates: 2 on
@@ -1813,6 +1837,27 @@ with no window open, and they change as the window moves between displays, so
 a program that follows them reads them each frame. They only report: gfx and
 ui apply neither, and how big to draw is the program's choice. For a ui the
 size of the system's own, pass `display_scale()` to `ui::set_scale`.
+
+With `WAIT_WHEN_IDLE`, `frame()` shows the screen only when something used
+the GPU since the last call or the window needs it redrawn. After a frame that
+drew nothing, the next `frame()` waits for an event, up to a second (16 ms
+while a gamepad is open and the window has focus), unless `quit()` was
+called; `delta_time()` leaves the wait out, so a timer that runs while idle
+reads `time()`. A resize leaves the screen black, so the program redraws
+when `screen_size()` changes.
+
+With `WINDOW_ONLY`, `open` makes the window, its input, events and time, but
+no GPU device, so another renderer draws into the window; a call that needs
+the device is a misuse. `native_window()` is the handle to draw into: a
+`CAMetalLayer` on Apple's systems, the `HWND` on Windows, the `ANativeWindow`
+on Android (a new one each time the app comes back to the foreground, 0 in the
+background), the `wl_surface` or X11 window on Linux, and 0 headless. On
+Linux, `native_display()` is the `wl_display` or `Display*`, and
+`native_kind()` says which, `NATIVE_WAYLAND` or `NATIVE_X11`. Another video
+driver, or another platform, fails the `open`. With `WAIT_WHEN_IDLE` as well,
+the renderer calls `presented(shown)` each frame, and a frame that showed
+nothing makes the next `frame()` wait; `needs_present()` is true while the
+window needs its image again. `presented()` without `WINDOW_ONLY` is a misuse.
 
 `set_fullscreen` makes the window borderless fullscreen at the desktop's
 resolution, or a window again. It returns false if the window can't change,
@@ -1835,6 +1880,11 @@ have made is printed when it happens and skipped, and the program aborts at
 the next `frame()`, `check()`, read back or `close()`. Examples are a draw
 with no pipeline bound, a texture the shader samples left unbound, a
 released handle, and a uniform struct of the wrong size.
+
+A lost GPU device (Vulkan's `VK_ERROR_DEVICE_LOST`) is printed once, and
+`frame()` returns false from then on, as if the window were closed, so the
+program can save and exit. Direct3D 12's device removal and Metal's loss
+aren't recognized yet.
 
 ### Input
 
@@ -2005,6 +2055,7 @@ fn save_png(t: Texture, path: const u8[:]) -> bool           // RGBA8 or BGRA8
 fn screenshot(path: const u8[:]) -> bool                     // the screen, as shown
 fn generate_mips(t: Texture)
 fn texture_info(t: Texture) -> TextureDesc
+fn format_supported(format: i32, usage: i32) -> bool
 fn release(t: Texture)
 
 struct Sampler { id: u32 }
@@ -2023,8 +2074,13 @@ Kinds `TEXTURE_2D`, `TEXTURE_2D_ARRAY`, `TEXTURE_3D`, `TEXTURE_CUBE` (faces
 `RGBA8`, `BGRA8`, `RGBA8_SRGB`, `R8`, `RG8`, `RGBA16F`, `RGBA32F`, `R16F`,
 `RG16F`, `R32F`, `RG32F`, `R32UI`, `RGBA8UI`, `RGB10A2`, `RG11B10F`, and
 `DEPTH16`, `DEPTH24`, `DEPTH32F`, `DEPTH24_STENCIL8`, `DEPTH` (32-bit float
-where it can also be sampled). Filters `NEAREST`, `LINEAR`; wraps `REPEAT`,
-`MIRROR`, `CLAMP`; compares `COMPARE_LESS` and the like.
+where it can also be sampled), and the block-compressed `BC1`, `BC3`, `BC7`,
+`ASTC_4x4`, `ASTC_5x5`, `ASTC_6x6`, `ASTC_8x8`: `SAMPLED` only, updated a
+whole mip at a time (region `w` 0, data in whole blocks), and not read back
+or given `generate_mips`. `format_supported` says whether the device makes a
+texture of a format and usage; ask it before using a compressed format.
+Filters `NEAREST`, `LINEAR`; wraps `REPEAT`, `MIRROR`, `CLAMP`; compares
+`COMPARE_LESS` and the like.
 
 ### Pipelines and drawing
 
@@ -2059,6 +2115,12 @@ fn draw_indexed(indices: i64)                   fn draw_indexed_instanced(indice
 fn draw(vertices, instances, first_vertex, first_instance)
 fn draw_indexed(indices, instances, first_index, vertex_offset, first_instance)
 ```
+
+A pass with a `resolve` target resolves its multisampled `color` target into
+it and drops the samples of its multisampled color and depth targets: a later
+pass that loads them rather than clears them is a misuse. A pass that
+doesn't resolve keeps them, so a frame can draw over several passes and
+resolve in the last.
 
 A pipeline is not tied to the formats it draws into; it is made for each
 pass's targets the first time it is bound in one. The vertex shader's inputs

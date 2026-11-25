@@ -1,5 +1,5 @@
-; Goose highlighting, nvim-style capture names. Later patterns win where two
-; cover the same bytes, so the broad rules come first.
+; Goose highlighting. Later patterns win where two cover the same bytes,
+; so the broad rules come first.
 
 (identifier) @variable
 
@@ -13,13 +13,18 @@
 (field_declaration name: (identifier) @property)
 (field_expression field: (identifier) @property)
 (field_initializer name: (identifier) @property)
+(storage_name field: (identifier) @property)
 
 (namespace_declaration name: (identifier) @module)
+(namespace_alias name: (identifier) @module)
+(namespace_alias target: (identifier) @module)
 (import_path (identifier) @module)
 (scoped_identifier namespace: (identifier) @module)
 
 (function_declaration name: (identifier) @function)
 (function_declaration name: (scoped_identifier name: (identifier) @function))
+(extern_member name: (identifier) @function)
+(extern_member name: (scoped_identifier name: (identifier) @function))
 (call_expression function: (identifier) @function.call)
 (call_expression function: (scoped_identifier name: (identifier) @function.call))
 ; A call through a dot is a method call or a call of a free function by UFCS.
@@ -62,6 +67,7 @@
 
 (function_modifier) @keyword.modifier
 "root" @keyword.modifier
+(extern_block "extern" @keyword.modifier)
 
 ; The queries of a const if condition, keywords there only.
 (const_query name: (identifier) @keyword)

@@ -1,6 +1,7 @@
 // Goose compiler — driver. Includes establish the project-wide header order.
 
 #include "includes.h"
+#include "build_paths.h"   // GOOSE_STDLIB_PATH
 #include "utils.h"
 #include "small_vector.h"
 #include "flat_map.h"
@@ -37,6 +38,7 @@
 #include "codegen_render.h"
 #include "codegen_emit.h"
 #include "codegen_stacks.h"
+#include "codegen_merge.h"
 #include "codegen_nodes.h"
 #include "runtime_inline.h"
 #include "process.h"
@@ -198,6 +200,9 @@ static Diagnostic ImportDiagnostic(const string &file, const Import &imp, const 
 // they are used.
 void ParseProgram(Ast &ast, const string &rootpath, const vector<string> &stdlibdirs,
                   const string &exedir, const SourceProvider &sources = {}) {
+    auto available = [&](const string &path) {
+        return (sources && sources(path)) || FileExists(path);
+    };
     // The program is package 0; a standard library directory becomes a
     // package the first time a module in it is reached.
     auto rootdir = DirOf(rootpath);
@@ -292,7 +297,7 @@ void ParseProgram(Ast &ast, const string &rootpath, const vector<string> &stdlib
         fileof[path] = fileidx;
         importsof.emplace_back();
         auto &[filename, source] = ast.sources.back();
-        Parser parser(ast, filename, source->c_str(), fileidx);
+        Parser parser(ast, filename, *source, fileidx);
         parser.ParseTop();
         for (auto &imp : parser.imports) {
             // The package this import declares or loads, where it does.
@@ -380,11 +385,11 @@ void ParseProgram(Ast &ast, const string &rootpath, const vector<string> &stdlib
                     // A package's own name, from inside it, is its own file.
                     if (it != declared.end() && it->second.pkg == pkg) it = declared.end();
                     if (it == declared.end() && failedpkgs.count(first)) continue;
-                    auto blessed = it == declared.end() && !FileExists(local) ? BlessedLookup(first)
+                    auto blessed = it == declared.end() && !available(local) ? BlessedLookup(first)
                                                                                : nullptr;
                     if (blessed) pkgname = blessed->package;
                     if (it != declared.end()) {
-                        if (FileExists(local))
+                        if (available(local))
                             ImportError(filename, imp,
                                         cat(imp.path, " is both a file of this package (", local,
                                             ") and the declared package ", first, "'s module"));
@@ -399,10 +404,10 @@ void ParseProgram(Ast &ast, const string &rootpath, const vector<string> &stdlib
                         imppath = cat(ast.packages[imppkg].root, rest, ".goose");
                     } else {
                         imppath = local;
-                        if (!FileExists(local)) {
+                        if (!available(local)) {
                             for (auto &dir : stdlibdirs) {
                                 auto cand = cat(dir, imp.path, ".goose");
-                                if (FileExists(cand)) {
+                                if (available(cand)) {
                                     imppath = cand;
                                     imppkg = stdlibpkg(dir);
                                     break;
@@ -447,6 +452,22 @@ void ParseProgram(Ast &ast, const string &rootpath, const vector<string> &stdlib
             }
         }
     }
+    // A namespace alias's target must be a namespace some file declares,
+    // which only now are all known. Where an error came first, a file that
+    // would have declared it may be the one that failed to load or parse,
+    // so the target is not reported as well. An alias may take the name of
+    // a namespace: it holds in its own file alone, which then reaches that
+    // namespace only through an alias of another name.
+    if (ast.errors.empty())
+        for (auto &a : ast.nsaliases) {
+            if (ast.FindNS(a.target)) continue;
+            Diagnostic d;
+            d.where = LocOf(a.targetline);
+            d.where.endline = a.targetline.line;
+            d.where.endcol = a.targetline.col + (int)a.target.size();
+            d.message = cat("unknown namespace ", a.target, " in namespace alias ", a.name);
+            ast.Report(d);
+        }
     // Globals initialize in import order: everything a file imports runs before
     // the file's own, so a global initializer may name an imported global
     // (`let IDENT = Xf { ..., t: float3_0 }`). Files parse in worklist order,
@@ -930,6 +951,9 @@ Options:
   --bce-test            Verify the `// bce:elide` and `// bce:keep` annotations.
   --unsafe-no-rf-check  Leave out the checks after calls that a `return ...
                         from` can pass through: unsound, for pricing them only.
+  --no-copy-elision     Copy every argument and result of a fixed struct over
+                        256 bytes, which the C otherwise often shares: a
+                        reference the same program must print the same with.
   --gen-runtime-header  Regenerate src/runtime_inline.h from src/runtime/.
 
 goose format --verify file.goose|dir... formats each file in memory and
@@ -1272,10 +1296,19 @@ static string ManPage() {
             auto line = string_view(text).substr(pos, e - pos);
             pos = e + 1;
             if (!line.empty() && (line[0] == '.' || line[0] == '\'')) s += "\\&";
-            for (auto c : line) {
+            for (size_t i = 0; i < line.size(); i++) {
+                auto c = line[i];
                 if (c == '\\') s += "\\e";
                 else if (c == '-') s += "\\-";
                 else s += c;
+                // troff takes `.`, `!` or `?` (past any closing `)]"'*`) followed by
+                // spaces mid-line as the end of a sentence, and groff 1.25's -w style
+                // warns about it, e.g. at "args...  What". `\&` keeps it a plain
+                // character and prints nothing.
+                if (c == '.' || c == '!' || c == '?') {
+                    auto j = line.find_first_not_of(")]\"'*", i + 1);
+                    if (j != string_view::npos && line[j] == ' ') s += "\\&";
+                }
             }
             s += '\n';
         }
@@ -1376,6 +1409,7 @@ int Main(int argc, char **argv) {
     auto roundtrip = false, multitest = false;
     auto nobce = false, bcetest = false, bcelines = false, norfcheck = false;
     auto nounreached = false;
+    auto noelide = false;
     auto stacks = false;
     auto stats = false;
     auto forcejit = false, standalone = false, shared = false;
@@ -1429,6 +1463,8 @@ int Main(int argc, char **argv) {
         else if (arg == "--bce-lines") bcelines = true;
         // Unsound; a measurement aid only (see CodeGen::norfcheck).
         else if (arg == "--unsafe-no-rf-check") norfcheck = true;
+        // A reference for testing (see CodeGen::noelide).
+        else if (arg == "--no-copy-elision") noelide = true;
         else if (arg == "--jit") forcejit = true;
         else if (arg == "--standalone") standalone = true;
         else if (arg == "--split") split = true;
@@ -1759,7 +1795,7 @@ int Main(int argc, char **argv) {
             if (string_view(rf.name) == "runtime_ext.h") runtime_ext_text = rf.text;
         auto stackcfg = StackConfigOf(cdefines);
         CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, shared,
-                   stackcfg.maxstacks);
+                   stackcfg.maxstacks, noelide);
         phase("codegen");
         if (stacks) cg.StackReport(msgs, stackcfg);
         // The packages whose native parts the program needs, which a JIT

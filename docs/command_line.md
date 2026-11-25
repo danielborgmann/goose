@@ -224,6 +224,7 @@ The `-D` macros that the runtime reads, which configure a program:
 | `GS_DEBUG` | 0 | 1 is what `--debug` sets: the overflow, range and tag checks. |
 | `GS_STACK_STATS` | 0 | 1 makes each thread program report its data stack use on stderr as it ends. |
 | `GS_STACK_RESERVE` | 2 GB | The address space reserved per data stack, which `--stack-reserve` sets. |
+| `GS_THREAD_STACK` | 8 MB | The native stack each worker thread reserves, where the system's default is less (512 KB on macOS, 1 MB on Windows). |
 | `GS_STACK_GAP` | 1 MB | The unmapped gap after each data stack, which makes runaway growth abort. |
 | `GS_STACK_BUDGET` | 32 TB | The address space all thread programs together are meant to take; `hardware_threads()` is capped at what it has room for. |
 | `GS_MAX_STACKS` | 1024 | The most data stacks one thread program may use. A program that needs more fails to compile. |
@@ -505,6 +506,7 @@ These look into what the compiler does, and serve its test suite
 | `--multi-test file...` | Compile each file as a run of its own would, and end what each printed with a line on stdout and stderr: `==== goose --multi-test: exit <code> <file>`. A `%` in `-o` stands for each file's name. |
 | `--bce-test` | Verify the `// bce:elide` and `// bce:keep` annotations in the source. |
 | `--unsafe-no-rf-check` | Leave out the checks after calls that a `return ... from` can pass through. This is unsound, and is only for measuring what they cost. |
+| `--no-copy-elision` | Copy every argument and result of a fixed struct over 256 bytes, where the generated C would otherwise share the caller's storage. A program prints the same either way; the test suite compares the two. |
 | `--gen-runtime-header` | Regenerate `src/runtime_inline.h` from `src/runtime/` (`GOOSE_RUNTIME` names that directory if it is not found). |
 | `--compile-shader file` | Print what a shader compiles to, without a program around it; `--shader-source msl` or `hlsl` prints that source as well. |
 

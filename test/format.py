@@ -231,6 +231,13 @@ def check_cli(exe, root):
            code == 2 and "error" in err and bad.read_text() == "fn f( {\n" and
            good.read_text() == tidy, f"exit {code}: {out}{err}")
 
+    # A NUL byte is text the parse rejects, not the file's end that would
+    # leave the rest out of the rewrite.
+    nul = write("nul.goose", "fn f(){a;}\0\nfn g() {}\n")
+    code, out, err = run(exe, [nul])
+    expect("a file with a NUL byte", code == 2 and "NUL character" in err and
+           nul.read_bytes() == b"fn f(){a;}\0\nfn g() {}\n", f"exit {code}: {out}{err}")
+
     # A read-only file is not replaced.
     ro = write("ro.goose", messy)
     os.chmod(ro, stat.S_IREAD)
@@ -308,6 +315,26 @@ def check_deep_indent_cap(exe):
         raise RuntimeError("format deep indentation result is not idempotent")
 
 
+def check_deep_block_dump(exe, root):
+    """A deeply nested block's dump is linear in depth. The formatter's
+    self-check dumps its input and output in full, so an uncapped dump would
+    make formatting quadratic in time and memory."""
+    depth = 10000
+    src = root / "deep_blocks.goose"
+    src.write_text("fn main() { " + "{" * depth + "}" * depth + " }\n", encoding="utf-8")
+    code, out, err = tc.run_capture([exe, "check", "--dump", src], timeout=60)
+    if code != 0:
+        raise RuntimeError(f"format deep block dump: exit {code}:\n{err}")
+    # Two lines per block, each indented by no more than 256 columns plus its
+    # brace: linear in depth, not the ~4*depth^2 of an uncapped dump.
+    linear_bound = 2 * depth * (256 + 16) + 4096
+    if len(out) > linear_bound:
+        raise RuntimeError(f"format deep block dump too large: {len(out)} > {linear_bound}")
+    code, out, err = run(exe, [src])
+    if code != 0:
+        raise RuntimeError(f"format deep block dump: formatting failed: exit {code}:\n{err}")
+
+
 def check_format(exe, base):
     """Raises RuntimeError on a failure."""
     check_deep_indent_cap(exe)
@@ -317,6 +344,7 @@ def check_format(exe, base):
     base.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="format-", dir=base) as tmp:
         root = Path(tmp)
+        check_deep_block_dump(exe, root)
         check_cli(exe, root)
         check_docs(exe, root)
 
@@ -331,8 +359,8 @@ def check_format_sweep(exe, dirs):
     out, err = r.stdout.decode("utf-8", "replace"), r.stderr.decode("utf-8", "replace")
     if r.returncode != 0:
         raise RuntimeError(f"format --verify (exit {r.returncode}):\n{out}{err}")
-    broken = {"test/lsp/broken_decls.goose", "test/lsp/complete.goose", "test/lsp/exemplar.goose",
-              "test/syntax/lexer_tokens.goose"}
+    broken = {"test/lsp/broken_decls.goose", "test/lsp/builtins.goose", "test/lsp/complete.goose",
+              "test/lsp/exemplar.goose", "test/syntax/lexer_tokens.goose"}
     repo = Path(__file__).resolve().parent.parent
     for line in out.splitlines():
         if not line.startswith("skip "):

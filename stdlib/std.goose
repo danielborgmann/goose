@@ -411,7 +411,9 @@ fn position<T>(xs: T[:], v: T) -> i64 {
     return -1;
 }
 
-fn contains<T>(xs: T[:], v: T) -> bool { position(xs, v) >= 0 }
+// any rather than position(xs, v) >= 0, which would pass v on by value: a
+// non-fixed v, such as a string, is never copied implicitly (§4.1).
+fn contains<T>(xs: T[:], v: T) -> bool { any(xs) { it == v } }
 
 fn any<T, F>(xs: T[:]) -> bool {
     for x in xs { if F(x) { return true; } }
@@ -649,9 +651,16 @@ fn concat<T>(a: T[:], b: T[:]) -> T[>..] {
 fn fill<T>(xs: T[:], v: T) { for i in xs.len { xs[i] .= v; } }
 
 // Element by element, first to last; the lengths must agree.
-fn copy_into<T>(dst: T[:], src: T[:]) {
+// `dst.copy_from(src)` names the direction the call takes.
+fn copy_from<T>(dst: T[:], src: T[:]) {
     assert(dst.len == src.len);
     for i in dst.len { dst[i] .= src[i]; }
+}
+
+// The same copy under the old name. `dst.copy_into(src)` reads as a copy
+// out of dst, so a call warns. The arguments are unchanged: destination first.
+deprecated "use copy_from" fn copy_into<T>(dst: T[:], src: T[:]) {
+    copy_from(dst, src);
 }
 
 fn reverse<T>(xs: T[:]) {
@@ -854,8 +863,8 @@ fn sort<T, F>(xs: T[:]) {
 // form, and the merge leaves its own verdict in it for the next one.
 fn sort_merge<T, F>(l: T[:], r: T[:], d: T[:], chaotic: bool&) {
     if !F(r[0], l[l.len - 1]) {
-        copy_into(d[..l.len], l);
-        copy_into(d[l.len..], r);
+        copy_from(d[..l.len], l);
+        copy_from(d[l.len..], r);
         return;
     }
     var a = 0;
@@ -890,9 +899,9 @@ fn sort_merge<T, F>(l: T[:], r: T[:], d: T[:], chaotic: bool&) {
     }
     chaotic = switches * 4 > k;
     if a < l.len {
-        copy_into(d[k..], l[a..]);
+        copy_from(d[k..], l[a..]);
     } else {
-        copy_into(d[k..], r[b..]);
+        copy_from(d[k..], r[b..]);
     }
 }
 
@@ -950,7 +959,7 @@ fn stable_sort<T, F>(xs: T[:]) {
                 end = ends[i + 1];
                 sort_merge(src[start..mid], src[mid..end], dst[start..end], chaotic) { a, b => F(a, b) };
             } else {
-                copy_into(dst[start..end], src[start..end]);
+                copy_from(dst[start..end], src[start..end]);
             }
             ends[w] = end;
             w += 1;
@@ -1188,9 +1197,10 @@ fn format_int<B>(out: B&, v: i64, base: i64, width: i64, padc: u8) {
 // ULEB128 (§3.6), the encoding an image's framing prefix uses
 // (docs/design/serialization.md): what to_bytes writes in front of an
 // array's bytes, so that a reader of a stream or a file can size its read
-// before it has the whole image.
+// before it has the whole image. A negative v goes out as its 64 bits, ten
+// bytes (`as!`, since that conversion changes the value on purpose).
 fn format_uleb(out: u8[>..]&, v: i64) {
-    var x = v as u64;
+    var x = v as! u64;
     loop {
         let b = (x & 0x7f) as u8;
         x >>= 7;
@@ -1200,7 +1210,10 @@ fn format_uleb(out: u8[>..]&, v: i64) {
 }
 
 // The ULEB128 at the front of s: its value and its byte count, or 0, 0 when
-// the bytes do not hold one (unterminated, or past the 64-bit range).
+// the bytes do not hold one (unterminated, past the 64-bit range, or longer
+// than the shortest encoding, which is the only one §3.6 and from_bytes
+// accept). Bit 63 comes back as the sign, as format_uleb wrote it (`as!`
+// again).
 fn parse_uleb(s: u8[:]) -> i64, i64 {
     var v = 0 as u64;
     var shift = 0;
@@ -1210,7 +1223,10 @@ fn parse_uleb(s: u8[:]) -> i64, i64 {
         if shift > 63 || (shift == 63 && (b & 0x7e) != 0) { return 0, 0; }
         v |= (b & 0x7f) as u64 << shift;
         i++;
-        if b < 0x80 { return v as i64, i; }
+        if b < 0x80 {
+            if b == 0 && shift > 0 { return 0, 0; }
+            return v as! i64, i;
+        }
         shift += 7;
     }
     return 0, 0;
@@ -1412,14 +1428,25 @@ fn parse_uint(s: u8[:], base: i64 = 10) -> u64, bool {
     return v, true;
 }
 
-// A decimal float with optional sign, fraction and exponent, correctly
-// rounded; false otherwise.
+// A decimal float with optional sign, fraction and exponent, or the inf,
+// -inf and nan that print writes; correctly rounded, false otherwise.
 fn parse_flt(s: u8[:]) -> f64, bool {
     var i = 0;
     var neg = false;
     if s.len > 0 && (s[0] == '-' || s[0] == '+') {
         neg = s[0] == '-';
         i = 1;
+    }
+    // The non-finite spellings print and format write: inf and -inf, and
+    // nan, which they never write negative.
+    if i < s.len {
+        let rest = s[i..];
+        if rest == "inf" {
+            return if neg { -1.0 / 0.0 } else { 1.0 / 0.0 }, true;
+        }
+        if i == 0 && rest == "nan" {
+            return 0.0 / 0.0, true;
+        }
     }
     // The significant digits as one integer, with the decimal exponent
     // adjusted for the digits after the point, so the value is
@@ -1509,7 +1536,9 @@ fn compare(a: u8[:], b: u8[:]) -> i64 {
     return 0;
 }
 
-fn is_space(c: u8) -> bool { c == ' ' || c == '\t' || c == '\n' || c == '\r' }
+fn is_space(c: u8) -> bool {
+    c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\x0b' || c == '\x0c'
+}
 
 // ASCII character classes, as C's <ctype.h> has them in the C locale: no
 // byte from 0x80 up is in any of them. They are declared into a namespace

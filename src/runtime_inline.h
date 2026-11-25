@@ -1807,8 +1807,9 @@ typedef struct {
     gs_stack *stack;       /* Stable descriptor of the owning data stack. */
     /* Windows: one past the highest page the fault handler has
        committed, so gs_trim_memory releases only what was ever committed
-       rather than walking the whole reservation. Unused on POSIX, where
-       the kernel supplies pages on touch. */
+       rather than walking the whole reservation. Pages below it can still
+       be uncommitted: skipped by growth or decommitted by slice_pool's
+       trim. Unused on POSIX, where the kernel supplies pages on touch. */
     uint8_t *committed;
 } gs_region;
 static GS_TLS gs_region *gs_regions;
@@ -2004,15 +2005,21 @@ R"GSRT(static LONG WINAPI gs_fault_filter(EXCEPTION_POINTERS *ep) {
         if ((uintptr_t)hit - (uintptr_t)r->base < r->size) {
             /* Within the usable part: commit another chunk (clamped to the
                region) and resume, or where the system has no more memory to
-               commit, say so. Within the gap: a data stack overran. A chunk
+               commit, say so. A read below the commit mark (a page that was
+               skipped or decommitted by slice_pool's trim) commits only its
+               page, so a stale view does not take back the pages around it;
+               a write there still takes a chunk, as reuse writes on. A chunk
                is as large as what the region has committed so far, from
                GS_COMMIT_FIRST up to GS_COMMIT_CHUNK: a stack that stays small
-               is charged little, and one that grows faults about as often. */
+               is charged little, and one that grows faults about as often.
+               Within the gap: a data stack overran. */
             if (hit < r->base + r->usable) {
                 uint8_t *page = (uint8_t *)((size_t)hit & ~(gs_page_size - 1));
                 size_t n = (size_t)(r->committed - r->base);
                 if (n < GS_COMMIT_FIRST) n = GS_COMMIT_FIRST;
                 if (n > GS_COMMIT_CHUNK) n = GS_COMMIT_CHUNK;
+                if (page < r->committed && ep->ExceptionRecord->ExceptionInformation[0] == 0)
+                    n = gs_page_size;
                 if (page + n > r->base + r->usable)
                     n = (size_t)(r->base + r->usable - page);
                 if (VirtualAlloc(page, n, MEM_COMMIT, PAGE_READWRITE)) {
@@ -2354,7 +2361,18 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
     gs_regions[i].stack = stack;
     gs_regions[i].committed = p;
     gs_nregions = i + 1;  /* Publish only the initialized entry. */
-    return p;
+
+)GSRT"
+R"GSRT(    /* Region bases agree in their low 16 or more address bits (Windows
+       reserves on 64 KB boundaries; mmap'd regions lie 2 GB + 1 MB apart),
+       so the same offset in two stacks does too. A loop storing to several
+       stacks in step then runs up to 2x slower (Zen 5, six f32 arrays),
+       though sharing a page offset alone costs nothing: bases 4 KB apart
+       run at full speed. A different 64-byte step per region within the
+       smallest page breaks the match. */
+    long colors = 4096 / 64;
+    size_t pad = (size_t)(i % colors) * 64;
+    return p + pad;
 }
 
 )GSRT"
@@ -2975,12 +2993,16 @@ R"GSRT(/* ----------------------------------------------------------------------
 R"GSRT(   Every x86-64 CPU has SSE2, so the comparisons test blocks of 16 bytes
    without any dispatch. The tables take SSSE3's pshufb, which the CPU is
    asked for as the runtime starts, and a search where either set is of kind
-   5 tests both by their tables. Without SSSE3 such a search, and on other
-   targets, under TinyCC (which has no intrinsics), or over fewer than 16
-   positions, every search, tests one byte at a time, a single byte by
-   memchr. No load reaches past the range: its last part is tested as the
-   range's last whole block, with the positions before it, already tested,
-   shifted out of the result.
+   5 tests both by their tables. Every AArch64 CPU has NEON, whose TBL does
+   the same lookups, so there both tests run without dispatch. NEON has no
+   movemask: a block's result is narrowed to 4 bits a byte (shrn), which
+   gives one 64-bit word with a nibble for each byte, in order. Without
+   SSSE3 a search by the tables, and on other targets (and big-endian
+   AArch64, and MSVC for ARM64), under TinyCC (which has no intrinsics), or
+   over fewer than 16 positions, every search, tests one byte at a time, a
+   single byte by memchr. No load reaches past the range: its last part is
+   tested as the range's last whole block, with the positions before it,
+   already tested, shifted out of the result.
 
 )GSRT"
 R"GSRT(   The set is a ByteSet the program wrote, read here as a gs_byteset: may_alias
@@ -3111,36 +3133,126 @@ static GS_SSSE3 GS_INLINE __m128i gs_bsm_tables(const gs_bsm *m, __m128i x) {
 
 )GSRT"
 R"GSRT(#define GS_LOAD(q) _mm_loadu_si128((const __m128i *)(q))
+#define GS_AND(x, y) _mm_and_si128(x, y)
 
 )GSRT"
-R"GSRT(/* The block loop of a search over n >= 16 positions for the bytes TEST
+R"GSRT(/* A block's members as a mask, bit i for byte i; GS_BMASK_DROP removes the
+   first k positions and GS_BMASK_FIRST is the first that is left. */
+typedef unsigned gs_bmask;
+#define GS_BMASK(v) ((unsigned)_mm_movemask_epi8(v))
+#define GS_BMASK_DROP(m, k) ((m) >> (k))
+#define GS_BMASK_FIRST(m) gs_ctz32(m)
+
+)GSRT"
+R"GSRT(#elif !defined(__TINYC__) && defined(__aarch64__) && !defined(__ARM_BIG_ENDIAN) && \
+    (defined(__GNUC__) || defined(__clang__))
+#define GS_SCAN_NEON 1
+#include <arm_neon.h>
+#define GS_SSSE3
+
+)GSRT"
+R"GSRT(static void gs_scan_init(void) {}
+
+)GSRT"
+R"GSRT(typedef struct { uint8x16_t a, b, c, flip; } gs_bsm;
+
+)GSRT"
+R"GSRT(static const uint8_t gs_bsm_bits[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+
+)GSRT"
+R"GSRT(static GS_INLINE void gs_bsm_init(gs_bsm *m, const gs_byteset *s, int tables) {
+    if (tables) {
+        m->a = vld1q_u8(s->lo);
+        m->b = vld1q_u8(s->hi);
+        m->c = vld1q_u8(gs_bsm_bits);
+        m->flip = vdupq_n_u8(0);
+    } else {
+        m->a = vdupq_n_u8(s->bytes[0]);
+        m->b = vdupq_n_u8(s->bytes[1]);
+        m->c = vdupq_n_u8(s->bytes[2]);
+        m->flip = vdupq_n_u8(s->invert ? 0xff : 0);
+    }
+}
+
+)GSRT"
+R"GSRT(/* As the SSE2 gs_bsm_test: the members among the 16 bytes of x, as 0xff
+   bytes, for a set of kind k from 1 to 4. */
+static GS_INLINE uint8x16_t gs_bsm_test(const gs_bsm *m, int k, uint8x16_t x) {
+    uint8x16_t r;
+    if (k == 1) {
+        r = vceqq_u8(x, m->a);
+    } else if (k == 2) {
+        r = vorrq_u8(vceqq_u8(x, m->a), vceqq_u8(x, m->b));
+    } else if (k == 3) {
+        r = vorrq_u8(vorrq_u8(vceqq_u8(x, m->a), vceqq_u8(x, m->b)), vceqq_u8(x, m->c));
+    } else {
+        r = vcleq_u8(vsubq_u8(x, m->a), m->b);
+    }
+    return veorq_u8(r, m->flip);
+}
+
+)GSRT"
+R"GSRT(/* The same by the tables. TBL gives 0 for an index of 16 or more, so
+   masking x with 0x8f looks up lo[x & 15] where x < 128 and gives 0 where
+   not, and the same of x ^ 0x80 looks up hi[x & 15] where x >= 128. */
+static GS_INLINE uint8x16_t gs_bsm_tables(const gs_bsm *m, uint8x16_t x) {
+    uint8x16_t low4 = vdupq_n_u8(0x8f);
+    uint8x16_t lo = vqtbl1q_u8(m->a, vandq_u8(x, low4));
+    uint8x16_t hi = vqtbl1q_u8(m->b, vandq_u8(veorq_u8(x, vdupq_n_u8(0x80)), low4));
+    uint8x16_t bit = vqtbl1q_u8(m->c, vshrq_n_u8(x, 4));
+    return vceqq_u8(vandq_u8(vorrq_u8(lo, hi), bit), bit);
+}
+
+)GSRT"
+R"GSRT(#define GS_LOAD(q) vld1q_u8(q)
+#define GS_AND(x, y) vandq_u8(x, y)
+
+)GSRT"
+R"GSRT(/* A block's members as a mask, the nibble i (4 bits) for byte i: shifting
+   each 16-bit lane right by 4 and keeping its low byte (shrn) takes the high
+   nibble of the lane's first byte and the low nibble of its second. */
+typedef uint64_t gs_bmask;
+static GS_INLINE uint64_t gs_bmask_neon(uint8x16_t v) {
+    return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(v), 4)), 0);
+}
+#define GS_BMASK(v) gs_bmask_neon(v)
+#define GS_BMASK_DROP(m, k) ((m) >> (4 * (k)))
+#define GS_BMASK_FIRST(m) (__builtin_ctzll(m) >> 2)
+
+)GSRT"
+R"GSRT(#else
+static void gs_scan_init(void) {}
+#endif
+
+)GSRT"
+R"GSRT(#if defined(GS_SCAN_SSE2) || defined(GS_SCAN_NEON)
+/* The block loop of a search over n >= 16 positions for the bytes TEST
    finds in a block. */
 #define GS_ANY_LOOP(TEST)                                                              \
     int64_t i = 0;                                                                     \
-    unsigned k;                                                                        \
+    gs_bmask k;                                                                        \
     for (; i + 16 <= n; i += 16) {                                                     \
-        k = (unsigned)_mm_movemask_epi8(TEST(GS_LOAD(p + i)));                         \
-        if (k) return i + gs_ctz32(k);                                                 \
+        k = GS_BMASK(TEST(GS_LOAD(p + i)));                                            \
+        if (k) return i + GS_BMASK_FIRST(k);                                           \
     }                                                                                  \
     if (i == n) return -1;                                                             \
-    k = (unsigned)_mm_movemask_epi8(TEST(GS_LOAD(p + n - 16))) >> (16 - (n - i));      \
-    return k ? i + gs_ctz32(k) : -1;
+    k = GS_BMASK_DROP(GS_BMASK(TEST(GS_LOAD(p + n - 16))), 16 - (n - i));              \
+    return k ? i + GS_BMASK_FIRST(k) : -1;
 
 )GSRT"
 R"GSRT(/* The same over np >= 16 positions for two sets, d bytes apart. */
 #define GS_PAIR_LOOP(TESTA, TESTB)                                                     \
     int64_t i = 0;                                                                     \
-    unsigned k;                                                                        \
+    gs_bmask k;                                                                        \
     for (; i + 16 <= np; i += 16) {                                                    \
-        k = (unsigned)_mm_movemask_epi8(                                               \
-            _mm_and_si128(TESTA(GS_LOAD(p + i)), TESTB(GS_LOAD(p + i + d))));          \
-        if (k) return i + gs_ctz32(k);                                                 \
+        k = GS_BMASK(GS_AND(TESTA(GS_LOAD(p + i)), TESTB(GS_LOAD(p + i + d))));        \
+        if (k) return i + GS_BMASK_FIRST(k);                                           \
     }                                                                                  \
     if (i == np) return -1;                                                            \
-    k = (unsigned)_mm_movemask_epi8(_mm_and_si128(TESTA(GS_LOAD(p + np - 16)),         \
-                                                  TESTB(GS_LOAD(p + np - 16 + d))))    \
-        >> (16 - (np - i));                                                            \
-    return k ? i + gs_ctz32(k) : -1;
+    k = GS_BMASK_DROP(GS_BMASK(GS_AND(TESTA(GS_LOAD(p + np - 16)),                     \
+                                      TESTB(GS_LOAD(p + np - 16 + d)))),               \
+                      16 - (np - i));                                                  \
+    return k ? i + GS_BMASK_FIRST(k) : -1;
 
 )GSRT"
 R"GSRT(#define GS_TEST_S(x) gs_bsm_test(&ms, ks, x)
@@ -3208,10 +3320,6 @@ R"GSRT(static int64_t gs_scan_pair_blocks(const uint8_t *p, int64_t np, const gs
         default: return gs_scan_pair_k(p, np, a, d, b, 4, 4);
     }
 }
-
-)GSRT"
-R"GSRT(#else
-static void gs_scan_init(void) {}
 #endif
 
 )GSRT"
@@ -3222,6 +3330,8 @@ R"GSRT(GS_API int64_t gs_scan_any(const uint8_t *p, int64_t n, const void *set) 
 #ifdef GS_SCAN_SSE2
     if (n >= 16 && s->kind != 5) return gs_scan_any_blocks(p, n, s);
     if (n >= 16 && gs_cpu_ssse3) return gs_scan_any_tables(p, n, s);
+#elif defined(GS_SCAN_NEON)
+    if (n >= 16) return s->kind != 5 ? gs_scan_any_blocks(p, n, s) : gs_scan_any_tables(p, n, s);
 #endif
     return gs_scan_any_bytes(p, n, s);
 }
@@ -3238,6 +3348,11 @@ R"GSRT(GS_API int64_t gs_scan_pair(const uint8_t *p, int64_t n, const void *a, i
 #ifdef GS_SCAN_SSE2
     if (np >= 16 && sa->kind != 5 && sb->kind != 5) return gs_scan_pair_blocks(p, np, sa, d, sb);
     if (np >= 16 && gs_cpu_ssse3) return gs_scan_pair_tables(p, np, sa, d, sb);
+#elif defined(GS_SCAN_NEON)
+    if (np >= 16) {
+        if (sa->kind != 5 && sb->kind != 5) return gs_scan_pair_blocks(p, np, sa, d, sb);
+        return gs_scan_pair_tables(p, np, sa, d, sb);
+    }
 #endif
     return gs_scan_pair_bytes(p, np, sa, d, sb);
 }
@@ -3861,6 +3976,17 @@ R"GSRT(    /* Publish completion only after all Goose storage has been released.
 }
 
 )GSRT"
+R"GSRT(/* The native stack a worker thread reserves: as much as the main thread
+   gets by default on macOS and Linux. The system's default for a thread
+   is far less on some (512 KB on macOS, 1 MB on Windows), which a few
+   native frames holding large fixed values can exhaust: a TLS handshake
+   on a worker thread does. Reserved, not committed: pages are touched as
+   the stack grows. A system default above this is kept. */
+#ifndef GS_THREAD_STACK
+#define GS_THREAD_STACK ((size_t)8 << 20)
+#endif
+
+)GSRT"
 R"GSRT(GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *),
                                void (*release)(void), void (*entry)(uint8_t *),
                                const void *args, int64_t argsize, int contained) {
@@ -3886,7 +4012,8 @@ R"GSRT(GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *
     gs_threads = t;
     int failed;
     #ifdef _WIN32
-        HANDLE handle = CreateThread(NULL, 0, gs_thread_main, t, 0, NULL);
+        HANDLE handle = CreateThread(NULL, GS_THREAD_STACK, gs_thread_main, t,
+                                      STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
         failed = handle == NULL;
         /* Closing the handle does not stop the worker. Completion is tracked
            above, so callers never need to retain or join a native handle. */
@@ -3896,7 +4023,10 @@ R"GSRT(GS_API int64_t gs_thread_start(void (*run)(void (*)(uint8_t *), uint8_t *
         pthread_attr_t attr;
         failed = pthread_attr_init(&attr);
         if (!failed) {
+            size_t size = 0;
             failed = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+            if (!failed && !pthread_attr_getstacksize(&attr, &size) && size < GS_THREAD_STACK)
+                failed = pthread_attr_setstacksize(&attr, GS_THREAD_STACK);
             if (!failed) failed = pthread_create(&handle, &attr, gs_thread_main, t);
             pthread_attr_destroy(&attr);
         }
@@ -4761,14 +4891,18 @@ R"GSRT(/* math's other libm functions (stdlib/math.goose). C has them set errno 
    function only by the name it is declared under, so there, and under
    clang on Apple, each name forwards to libm's, redeclared const: the
    compiler then still combines sin and cos of one value into sincos, turns
-   pow(x, 2.0) into x * x and folds constant arguments. Elsewhere the name
-   forwards to libm. */
+   pow(x, 2.0) into x * x and folds constant arguments. Since gcc 16, gcc
+   turns pow(x, 2.0) into x * x only without -fmath-errno (the call would
+   set errno on overflow), so under gcc pow squares a constant 2 itself;
+   that is the only one of gcc's folds that errno holds back. Elsewhere the
+   name forwards to libm. */
 #if defined(__clang__) && !defined(__APPLE__) && !defined(__TINYC__)
 #define GS_LIBM_SYM2(p, f) #p #f
 #define GS_LIBM_SYM(p, f) GS_LIBM_SYM2(p, f)
 #define GS_LIBM
 #define GS_LIBM1(f) __asm__(GS_LIBM_SYM(__USER_LABEL_PREFIX__, f)) __attribute__((const));
 #define GS_LIBM2(f) GS_LIBM1(f)
+#define GS_LIBM_POW(f) GS_LIBM1(f)
 #elif defined(__GNUC__) && !defined(__TINYC__)
 __attribute__((const)) double sin(double), cos(double), tan(double), asin(double), acos(double),
     atan(double), atan2(double, double), exp(double), log(double), log2(double), log10(double),
@@ -4781,10 +4915,12 @@ __attribute__((const)) float sinf(float), cosf(float), tanf(float), asinf(float)
 #define GS_LIBM static inline
 #define GS_LIBM1(f) { return f(x); }
 #define GS_LIBM2(f) { return f(x, y); }
+#define GS_LIBM_POW(f) { return __builtin_constant_p(y) && y == 2 ? x * x : f(x, y); }
 #else
 #define GS_LIBM static
 #define GS_LIBM1(f) { return f(x); }
 #define GS_LIBM2(f) { return f(x, y); }
+#define GS_LIBM_POW(f) GS_LIBM2(f)
 #endif
 GS_LIBM double gs_sin(double x) GS_LIBM1(sin)
 GS_LIBM double gs_cos(double x) GS_LIBM1(cos)
@@ -4797,7 +4933,7 @@ GS_LIBM double gs_exp(double x) GS_LIBM1(exp)
 GS_LIBM double gs_log(double x) GS_LIBM1(log)
 GS_LIBM double gs_log2(double x) GS_LIBM1(log2)
 GS_LIBM double gs_log10(double x) GS_LIBM1(log10)
-GS_LIBM double gs_pow(double x, double y) GS_LIBM2(pow)
+GS_LIBM double gs_pow(double x, double y) GS_LIBM_POW(pow)
 GS_LIBM double gs_hypot(double x, double y) GS_LIBM2(hypot)
 GS_LIBM double gs_cbrt(double x) GS_LIBM1(cbrt)
 GS_LIBM double gs_exp2(double x) GS_LIBM1(exp2)
@@ -4817,7 +4953,7 @@ GS_LIBM float gs_expf(float x) GS_LIBM1(expf)
 GS_LIBM float gs_logf(float x) GS_LIBM1(logf)
 GS_LIBM float gs_log2f(float x) GS_LIBM1(log2f)
 GS_LIBM float gs_log10f(float x) GS_LIBM1(log10f)
-GS_LIBM float gs_powf(float x, float y) GS_LIBM2(powf)
+GS_LIBM float gs_powf(float x, float y) GS_LIBM_POW(powf)
 GS_LIBM float gs_hypotf(float x, float y) GS_LIBM2(hypotf)
 GS_LIBM float gs_cbrtf(float x) GS_LIBM1(cbrtf)
 GS_LIBM float gs_exp2f(float x) GS_LIBM1(exp2f)
@@ -4981,6 +5117,7 @@ GS_API int64_t gs_os_time_ns(void);
 GS_API int64_t gs_os_clock_ns(void);
 GS_API void gs_os_sleep_ms(int64_t ms);
 GS_API uint64_t gs_os_random_u64(void);
+GS_API uint8_t gs_os_random_bytes(sl_u8 out);
 /* os.trim_memory: discards unused complete pages of this thread program's
    data stacks. Defined with the region registry it walks (runtime_impl.h),
    but declared here like the other os primitives, so that no prototype is
@@ -5026,6 +5163,11 @@ R"GSRT(#include <time.h>
 #include <sys/stat.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+#include <sys/random.h>
+#else
+#include <unistd.h>
 #endif
 #endif
 
@@ -5816,9 +5958,86 @@ R"GSRT(GS_API void gs_os_sleep_ms(int64_t ms) {
 }
 
 )GSRT"
-R"GSRT(/* Entropy for seeding a PRNG (not cryptographic): /dev/urandom where there
-   is one; on Windows a splitmix64 mix of the clocks, the process id and an
-   address, which needs no library beyond the runtime's. */
+R"GSRT(/* Cryptographically secure random bytes from the OS into p[0..n): 1, or 0
+   if it gives none. Windows: ProcessPrng (bcryptprimitives.dll, Windows 10
+   and later, what Go and Rust use), else RtlGenRandom (advapi32.dll's
+   SystemFunction036), each looked up when first needed, so that a program
+   links no library beyond the runtime's (TinyCC's .def files list neither).
+   Elsewhere getentropy(3), 256 bytes a call, else /dev/urandom. */
+#ifdef _WIN32
+typedef BOOL (WINAPI *gs_os_process_prng)(PBYTE, SIZE_T);
+typedef BOOLEAN (WINAPI *gs_os_rtl_gen_random)(PVOID, ULONG);
+
+)GSRT"
+R"GSRT(/* A function of a system DLL: from the copy already loaded, else from one
+   loaded out of System32 only, as Go does. bcryptprimitives.dll is not a
+   KnownDLL, so a plain LoadLibraryW would look in the application's
+   directory first, and a DLL placed there would supply the program's keys. */
+static FARPROC gs_os_system_proc(const wchar_t *dll, const char *name) {
+    HMODULE h = GetModuleHandleW(dll);
+    if (!h) h = LoadLibraryExW(dll, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    return h ? GetProcAddress(h, name) : NULL;
+}
+
+)GSRT"
+R"GSRT(static int gs_os_entropy(uint8_t *p, size_t n) {
+    /* The function pointers themselves are published, with full barriers,
+       so a thread that sees one sees it whole (ARM64 too). Workers racing
+       the first call each look it up and find the same function. */
+    static PVOID volatile prng_fn, rtl_fn;
+    gs_os_process_prng prng = (gs_os_process_prng)InterlockedCompareExchangePointer(&prng_fn, NULL, NULL);
+    gs_os_rtl_gen_random rtl = (gs_os_rtl_gen_random)InterlockedCompareExchangePointer(&rtl_fn, NULL, NULL);
+    if (!prng && !rtl) {
+        prng = (gs_os_process_prng)gs_os_system_proc(L"bcryptprimitives.dll", "ProcessPrng");
+        if (prng) InterlockedExchangePointer(&prng_fn, (PVOID)prng);
+        else {
+            rtl = (gs_os_rtl_gen_random)gs_os_system_proc(L"advapi32.dll", "SystemFunction036");
+            if (rtl) InterlockedExchangePointer(&rtl_fn, (PVOID)rtl);
+        }
+    }
+    /* ProcessPrng always returns TRUE. */
+    if (prng) return prng(p, n) ? 1 : 0;
+    if (!rtl) return 0;
+    while (n > 0) {
+        ULONG part = n > 0x40000000u ? 0x40000000u : (ULONG)n;
+        if (!rtl(p, part)) return 0;
+        p += part;
+        n -= part;
+    }
+    return 1;
+}
+#else
+static int gs_os_entropy(uint8_t *p, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        size_t part = n - done > 256 ? 256 : n - done;
+        if (getentropy(p + done, part) != 0) break;
+        done += part;
+    }
+    if (done == n) return 1;
+    /* No getentropy (ENOSYS: a kernel before Linux 3.17): the device. */
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f) return 0;
+    while (done < n) {
+        size_t got = fread(p + done, 1, n - done, f);
+        if (got == 0) break;
+        done += got;
+    }
+    fclose(f);
+    return done == n;
+}
+#endif
+
+)GSRT"
+R"GSRT(GS_API uint8_t gs_os_random_bytes(sl_u8 out) {
+    if (out.len <= 0) return 1;
+    return (uint8_t)gs_os_entropy(out.data, (size_t)out.len);
+}
+
+)GSRT"
+R"GSRT(/* Entropy for seeding a PRNG: the OS's, as random_bytes takes it; if it
+   gives none, a splitmix64 mix of the clocks, the process id and an
+   address, which is not cryptographic. */
 static uint64_t gs_os_mix64(uint64_t x) {
     x += 0x9e3779b97f4a7c15u;
     x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9u;
@@ -5828,15 +6047,8 @@ static uint64_t gs_os_mix64(uint64_t x) {
 
 )GSRT"
 R"GSRT(GS_API uint64_t gs_os_random_u64(void) {
-#ifndef _WIN32
-    FILE *f = fopen("/dev/urandom", "rb");
-    if (f) {
-        uint64_t v = 0;
-        size_t n = fread(&v, 1, sizeof v, f);
-        fclose(f);
-        if (n == sizeof v) return v;
-    }
-#endif
+    uint64_t v = 0;
+    if (gs_os_entropy((uint8_t *)&v, sizeof v)) return v;
     /* Which call this is, counted atomically: workers calling at once each
        get a count of their own. */
 #ifdef _WIN32

@@ -47,8 +47,8 @@
 // the driver -- with its members declared in the order they are defined
 // across codegen_types.h, codegen_frames.h, codegen_values.h,
 // codegen_construct.h, codegen_stmts.h, codegen_calls.h, codegen_builtins.h,
-// codegen_render.h and codegen_emit.h; the per-node CgX / CgAny / CgStmt
-// overrides are codegen_nodes.h.
+// codegen_render.h, codegen_emit.h and codegen_merge.h; the per-node CgX /
+// CgAny / CgStmt overrides are codegen_nodes.h.
 #pragma once
 
 namespace goose {
@@ -185,6 +185,13 @@ struct CodeGen {
     // that never takes a long-distance return still prints the right answer
     // and the checks' cost can be priced (--unsafe-no-rf-check).
     bool norfcheck = false;
+    // Testing only: leave out none of the copies a PtrAbi value takes
+    // (--no-copy-elision). No destination is fresh (FreshLv), and no
+    // argument is handed over (MovableArg, DiesAtCall) or lent (StableArg),
+    // so every call works on copies of its own, as the language describes
+    // it. The same program built both ways must print the same thing, which
+    // test/copy_elision.py checks on programs it generates.
+    bool noelide = false;
 
     [[noreturn]] void Fail(Line l, const string &msg) {
         auto s = cat("codegen: ", msg);
@@ -553,7 +560,9 @@ struct CodeGen {
     };
     void StackReport(FILE *out, const StackConfig &cfg);
 
-    // Long-distance return targets (§7.9): id, per-ret TLS channels.
+    // Long-distance return targets (§7.9): id, per-ret TLS channels. The C
+    // spells an id only as what gs_rf is compared with or set to and in its
+    // channels' names, which is where MergeSpecs reads it.
     unordered_map<FnSpec *, int> fromids;
     set<FnSpec *> fromemitted;
 
@@ -1324,7 +1333,7 @@ struct CodeGen {
     string AtLeastLeft(TypeExpr *ct, const string &hi, const string &ctr, int k, bool fromzero);
     void GenBodyCopy(Block *bodyb, int si, size_t first = 0);
     void GenBlocked(ForLoop *f, int k, const string &more, const string &step,
-                    const function<void()> &bind, const string &cond);
+                    const function<void()> &bind, const string &cond, bool tail);
 
     // ------------------------------------------------------------------
     // Exits delivering a value: where the receiver expects it (§7.3, §7.9).
@@ -1368,6 +1377,7 @@ struct CodeGen {
     void GenFromReturn(Return *r);
 
     void EnsureFromChannels(FnSpec *t);
+    string FromChannels(FnSpec *t, const string &tid);
 
     // ------------------------------------------------------------------
     // Calls. Returns one entry per return value: a C expression for fixed
@@ -1418,9 +1428,9 @@ struct CodeGen {
     // declaration and every return that hands it back share that storage.
     map<const VarDef *, string> ibfixed;
     const VarDef *OpenIbFixed(InlineBlock *ib, const Dst &d);
-    static Dst FreshLv(const string &s, TypeExpr *t) {
+    Dst FreshLv(const string &s, TypeExpr *t) const {
         Dst d { DK_LVALUE, s, t };
-        d.fresh = true;
+        d.fresh = !noelide;
         return d;
     }
     void EmitFvArg(const VarDef *fv, vector<string> &args);
@@ -1550,7 +1560,7 @@ struct CodeGen {
     // version for; runtime.h names them (GS_SIMD_TARGET1, ...).
     static constexpr int SIMD_LEVELS = 2;
     void EmitSimdVersions(FnSpec *sp, const string &name, const string &params,
-                          const string &fnbody);
+                          const string &fnbody, vector<string> &names);
 
     // ------------------------------------------------------------------
     // Globals (§11.1): C globals plus dedicated data stacks for nonfixed
@@ -1584,6 +1594,23 @@ struct CodeGen {
     void EmitMain();
 
     // ------------------------------------------------------------------
+    // Identical functions (codegen_merge.h). Specializations that differ
+    // only in their key often have the same C, but for the names of the
+    // functions they call and the numbers of their long-distance returns:
+    // MergeSpecs keeps one function of each such group.
+
+    // A function EmitSpec wrote: where it lies in `code`, and the names it
+    // defines there (its own, then a simd function's versions).
+    struct SpecText {
+        FnSpec *sp;
+        bool er;
+        size_t begin, end;
+        vector<string> names;
+    };
+    vector<SpecText> spectexts;
+    void MergeSpecs();
+
+    // ------------------------------------------------------------------
     // Driver.
 
     // The program's C, in two parts: between them the driver splices the
@@ -1601,9 +1628,9 @@ struct CodeGen {
     // A function the extern support declares gets no prototype here.
     CodeGen(Ast &_ast, string_view runtime_ext_text, const vector<string> &headers,
             bool _norfcheck = false, bool _library = false, bool _sharedlibrary = false,
-            int64_t _maxstacks = 0)
+            int64_t _maxstacks = 0, bool _noelide = false)
         : ast(_ast), library(_library), sharedlibrary(_sharedlibrary),
-          norfcheck(_norfcheck), maxstacks(_maxstacks) {
+          norfcheck(_norfcheck), noelide(_noelide), maxstacks(_maxstacks) {
         for (auto t : ast.alltypes)
             if (t->kind == TY_REF && t->ref->pool) poolglobals.insert(t->ref->pool);
         ComputeRelRootMax();
@@ -1631,6 +1658,7 @@ struct CodeGen {
         EmitProgramInit();
         EmitExports();
         if (!library) EmitMain();
+        MergeSpecs();
         if (usesthreads) predefs = "#define GS_NEED_THREADS 1\n";
         if (usespar) predefs += "#define GS_PAR 1\n";
         if (usesracy) predefs += "#define GS_RACY 1\n";

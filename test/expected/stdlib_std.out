@@ -92,8 +92,12 @@ HELLO WORLD
 -150.0 true
 false
 true true
+inf -inf nan true true true
+true true true true true true
+true true true true true true
 -1 1 0 -1
 hi|x|y|
+1 3
 4 ac 0
 11
 3
