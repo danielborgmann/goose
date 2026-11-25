@@ -4582,7 +4582,9 @@ static void gs_par_start(int64_t n) {
         #ifdef _WIN32
             uint64_t m = gs_par_percore ? gs_par_cores[(gs_par_ncores - n + i) % gs_par_ncores]
                                         : gs_par_pmask;
-            HANDLE h = CreateThread(NULL, 0, gs_par_main, (LPVOID)(uintptr_t)m, 0, NULL);
+            /* As much native stack as a worker's (GS_THREAD_STACK). */
+            HANDLE h = CreateThread(NULL, GS_THREAD_STACK, gs_par_main, (LPVOID)(uintptr_t)m,
+                                    STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
             failed = h == NULL;
             if (h) CloseHandle(h);
         #else
@@ -4590,7 +4592,10 @@ static void gs_par_start(int64_t n) {
             pthread_attr_t attr;
             failed = pthread_attr_init(&attr);
             if (!failed) {
+                size_t size = 0;
                 failed = pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                if (!failed && !pthread_attr_getstacksize(&attr, &size) && size < GS_THREAD_STACK)
+                    failed = pthread_attr_setstacksize(&attr, GS_THREAD_STACK);
                 if (!failed) failed = pthread_create(&h, &attr, gs_par_main, NULL);
                 pthread_attr_destroy(&attr);
             }
